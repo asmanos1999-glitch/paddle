@@ -92,6 +92,17 @@ button,input,select{font:inherit;color:inherit}
 .toolbar{display:flex;gap:8px;flex-wrap:wrap;padding:12px 14px 14px;align-items:center}
 .toolbar .sep{width:1px;height:22px;background:var(--line-hi);margin:0 2px}
 .toolbar.stage{padding-top:0}
+.toolbar.score{padding-top:0}
+.scorebar{display:flex;align-items:center;gap:10px;padding:6px 14px;border-radius:10px;background:rgba(0,0,0,.45);
+  border:1px solid var(--line-hi);font-variant-numeric:tabular-nums;margin-right:4px;transition:box-shadow .3s}
+.scorebar .tm{font-size:12px;font-weight:700;letter-spacing:.04em}
+.scorebar .tm small{font-weight:600;opacity:.75;margin-left:4px}
+.scorebar .tm.a{color:#ffc83c}.scorebar .tm.b{color:#50aaff}
+.scorebar b{font-size:22px;line-height:1;min-width:30px;text-align:center}
+.scorebar .colon{opacity:.6;font-weight:700}
+.scorebar .meta{font-size:11px;color:var(--mute);margin-left:4px}
+.scorebar .own{width:7px;height:7px;border-radius:50%;background:transparent;display:inline-block}
+.scorebar.flash{box-shadow:0 0 0 2px #ffc83c,0 0 22px rgba(255,200,60,.55)}
 .toolbar .stage-l{font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:var(--mute);margin-right:2px}
 .btn[aria-pressed="true"]{border-color:var(--accent,#2bd49a);color:var(--accent,#2bd49a)}
 select{background:var(--bg2);border:1px solid var(--line-hi);border-radius:8px;padding:6px 8px;font-size:12.5px}
@@ -237,6 +248,20 @@ select{background:var(--bg2);border:1px solid var(--line-hi);border-radius:8px;p
       <button class="btn" id="btn-failover" title="Hot-swap Live camera &harr; clean match replay; the current view stays live until the other source is ready">&#x21C4; Failover [F12]</button>
       <button class="btn" id="btn-rotate" title="Rotate the live camera feed 90 deg clockwise and re-calibrate the court [R]">&#x1F504; Rotate [R]</button>
       <button class="btn" id="btn-camset" title="Open the webcam driver settings on the server machine (Power Line Frequency 50 Hz)">Camera settings</button>
+    </div>
+    <div class="toolbar score" role="group" aria-label="Live padel score">
+      <span class="stage-l">Score</span>
+      <div class="scorebar" id="scorebar" aria-live="polite">
+        <span class="own" id="sc-own-a"></span><span class="tm a">TEAM A<small>P1&middot;P2</small></span>
+        <b id="sc-pa">0</b><span class="colon">:</span><b id="sc-pb">0</b>
+        <span class="tm b">TEAM B<small>P3&middot;P4</small></span><span class="own" id="sc-own-b"></span>
+        <span class="meta" id="sc-meta">Games 0-0 &middot; Rally 0 shots</span>
+      </div>
+      <button class="btn" id="btn-pa" title="Award a point to Team A (P1 / P2) [1]">+1 Team A [1]</button>
+      <button class="btn" id="btn-pb" title="Award a point to Team B (P3 / P4) [2]">+1 Team B [2]</button>
+      <button class="btn" id="btn-sundo" title="Undo the last point">Undo</button>
+      <button class="btn" id="btn-sauto" aria-pressed="true" title="Automatic point detection from the ball tracker (rally ends: no return within 2.2 s)">Auto points</button>
+      <button class="btn danger" id="btn-sreset" title="Reset the score to 0 : 0, games 0-0 [0]">Reset score [0]</button>
     </div>
   </section>
 
@@ -458,7 +483,7 @@ function renderFeed(feed){
   if(!feed.length){ ul.innerHTML = '<li class="empty">Waiting for tracked players…</li>'; return; }
   ul.replaceChildren(...feed.map(c => { const li = document.createElement("li");
     const t = document.createElement("time"); t.textContent = c.time;
-    const tag = document.createElement("span"); tag.className = "tag"; tag.style.background = COLORS[c.player]; tag.textContent = c.player;
+    const tag = document.createElement("span"); tag.className = "tag"; tag.style.background = COLORS[c.player] || "#ffc83c"; tag.textContent = c.player;
     const tx = document.createElement("span"); tx.textContent = c.text;
     li.append(t, tag, tx); return li; }));
 }
@@ -503,8 +528,34 @@ function renderStatus(st){
 function onTelemetry(tel){
   lastTel = tel; if(tel.heatmap) lastHeat = tel.heatmap;
   renderPlayers(tel.players); renderFeed(tel.coach_feed); renderStatus(tel.status); drawMap(tel);
-  renderReview(tel.calibration_review);
+  renderReview(tel.calibration_review); if(tel.score) renderScore(tel.score);
 }
+/* ---------- live padel score ---------- */
+let lastPointT = null;
+function renderScore(sc){
+  $("#sc-pa").textContent = sc.points.A; $("#sc-pb").textContent = sc.points.B;
+  $("#sc-meta").textContent = `Games ${sc.games.A}-${sc.games.B} \u00B7 Points ${sc.total.A}-${sc.total.B} \u00B7 Rally ${sc.rally_shots} shots`;
+  const own = sc.rally_active ? sc.owner : null;
+  $("#sc-own-a").style.background = own === "A" ? "#ffc83c" : "transparent";
+  $("#sc-own-b").style.background = own === "B" ? "#50aaff" : "transparent";
+  $("#scorebar").classList.toggle("flash", !!sc.flash);
+  $("#btn-sauto").setAttribute("aria-pressed", String(!!sc.auto));
+  $("#btn-sundo").disabled = !sc.can_undo;
+  const lp = sc.last_point;
+  if(lp && lastPointT !== null && lp.t !== lastPointT)
+    toast(`${String.fromCodePoint(0x1F3C6)} POINT TEAM ${lp.team}!${lp.game ? " GAME!" : ""}  ${sc.points.A} : ${sc.points.B} \u00B7 Games ${sc.games.A}-${sc.games.B}${lp.auto ? " (auto)" : ""}`);
+  lastPointT = lp ? lp.t : 0;
+}
+async function scorePoint(team){ try{ const j = await api("/api/score/point", {team}); renderScore(j.score); }catch(e){} }
+async function scoreReset(){ try{ const j = await api("/api/score/reset", {}); renderScore(j.score); toast("Score reset: 0 : 0"); }catch(e){} }
+$("#btn-pa").addEventListener("click", () => scorePoint("A"));
+$("#btn-pb").addEventListener("click", () => scorePoint("B"));
+$("#btn-sreset").addEventListener("click", scoreReset);
+$("#btn-sundo").addEventListener("click", async () => { try{ const j = await api("/api/score/undo", {}); renderScore(j.score); toast("Last point undone"); }catch(e){} });
+$("#btn-sauto").addEventListener("click", async () => { try{
+  const on = $("#btn-sauto").getAttribute("aria-pressed") !== "true";
+  const j = await api("/api/score/auto", {enabled: on}); $("#btn-sauto").setAttribute("aria-pressed", String(j.auto));
+  toast(j.auto ? "Automatic point detection on" : "Automatic point detection off - use [1] / [2]"); }catch(e){} });
 function renderReview(rv){
   const bar = $("#review-bar"); if(!rv) return;
   const show = ["detecting","review","manual","failed"].includes(rv.state) && !vp.classList.contains("calibrating");
@@ -749,6 +800,8 @@ document.addEventListener("keydown", ev => {
     if(kk === "l"){ stageLock(); return; }
     if(kk === "m"){ qrModal.open ? closeQr() : openQr(); return; }
     if(kk === "r"){ stageRotate(); return; }
+    if(kk === "1" || kk === "2"){ scorePoint(kk === "1" ? "A" : "B"); return; }
+    if(kk === "0"){ scoreReset(); return; }
     if(kk === "e" && stageState.webcam){ stageExposure(); return; }
     if(stageState.locked && ["c","n","a"].includes(kk)){ toast("Calibration is locked - press L to unlock", true); return; }
   }

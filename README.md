@@ -95,7 +95,9 @@ Frames are never stretched.
   (`yolov8n-pose_openvino_model`) run through a direct OpenVINO runner (letterbox → infer → NumPy decode →
   NMS). This skips the Ultralytics predict wrapper. PyTorch is the automatic fallback (`--ai-backend`).
 - **Court-ROI cropping.** Once the court is confirmed, detection runs on the court polygon's bounding box
-  plus a 15 % margin.
+  plus a 15 % margin. If fewer than 4 court players are found for 1.5 s, one full-frame pass runs every
+  second, so a wrong or stale ROI cannot hide players for long. Calibration's own person pass is always
+  full-frame.
 - **Adaptive pose stride.** Each player gets a fresh pose every `--pose-stride` ticks (default 2).
   In between, keypoints are warped with the tracked box, then smoothed (keypoint EMA α 0.65).
 - **Box smoothing.** One-Euro filter for boxes; EMA for speeds.
@@ -127,6 +129,57 @@ Frames are never stretched.
 - **HUD (drawn last):** neon ring, 18-frame cyan→gold comet, `BALL: XX km/h | Shots: N` tag, and a
   pulsing minimap dot with a vector line.
 
+### Elevated / balcony cameras (railings, wire mesh, background courts)
+
+- **Foreground railing.** A wide dark horizontal band in the lower frame (balcony rail, hand rail) is
+  treated as the end of the visible floor. Nothing below it can become the court, so the walkway strip
+  under a railing is never selected. The court solvers, edge extraction and scoring treat the rows behind
+  the rail as hidden, not as "off the floor".
+- **Wire mesh and bars.** The floor mask is closed vertically (15x45, then 7x25) between 0.30 H and the
+  railing, which bridges thin dark horizontal obstructions without reaching a background court at the top.
+  Turf colour is sampled from a 5x5 median image, so wires never teach the colour model "dark turf".
+  Floor behind a dense mesh is also classified on that median image.
+- **Candidate gates.**
+  - A court candidate must span at least 28 % of the frame height, and its centroid must not lie in the
+    bottom 18 %.
+  - The calibration person pass is full-frame. Each candidate earns a bonus for the share of player feet
+    (y 18–80 %) that it contains.
+  - Ankle keypoints sitting on the railing (feet hidden behind it) are ignored as colour seeds.
+- **Players.**
+  - A skeleton, when present, must look human: a shoulder above a hip, a plausible torso, legs below the
+    hip, consistent shoulder and hip widths.
+  - Without a skeleton, the box h/w must be 1.15–4.2 (h/w above 4.2 is always rejected).
+  - A box that extends below the railing's bottom edge stands in front of it (a balcony post, or a
+    spectator on the walkway) and is rejected.
+  - Feet: x −1.2…11.2 m (side openings, foot on the turf); lengthwise up to the back glass (−0.95 m for
+    upright players). Nothing behind the back glass is tracked.
+
+### Player slots and teams
+
+**Team A** is the near half (camera side, court y ≥ 10 m): **P1** near-left, **P2** near-right.
+**Team B** is the far half: **P3** far-left, **P4** far-right. Left and right seed the first assignment.
+Hungarian matching on court positions (velocity-gated) then keeps each identity, and a player is never
+assigned across the net.
+
+### Live score (`padeliq_score.py`)
+
+- **Display.** Official padel scoring: 0 → 15 → 30 → 40 → GAME, with golden point at 40 : 40, plus games
+  and total points per team. A broadcast banner sits top-centre on the desktop HUD and in the web stream:
+  `TEAM A [P1-P2]  15 : 30  TEAM B [P3-P4]`, then `Games | Points | Rally`. A gold
+  `🏆 POINT TEAM X!` badge shows for 2.6 s after each point.
+- **Automatic points (heuristic, single camera).**
+  - A rally starts at the first shot or the first confirmed net crossing.
+  - The team whose half the ball enters must play it. A shot hands it to the other team. A ball that
+    stays on the hitter's side (the net) returns it to the hitter.
+  - If that team does not return the ball within 2.2 s (ball stopped, lost, out or in the net), the other
+    team scores.
+  - After each point there is a 3.5 s cooldown.
+- **Manual override, always available:** `1` / `2` add a point for Team A / B, `0` resets. On the
+  dashboard: **+1 Team A [1]**, **+1 Team B [2]**, **Undo**, **Auto points** (on/off) and
+  **Reset score [0]**. Undo is web-only.
+- **Ball recall matters.** With low ball visibility (e.g. a phone over Wi-Fi), automatic points are less
+  reliable, so keep the manual keys at hand.
+
 ### Benchmarks (this laptop, CPU only)
 
 | Metric                                   | Before          | After                      |
@@ -155,6 +208,8 @@ E2E = camera frame captured (or phone JPEG received) → annotated JPEG ready.
 | `F12` | Failover: live camera ↔ clean replay, swapped only once the target has frames | Failover button |
 | `M`   | Mobile QR portal overlay                      | Mobile QR Portal modal           |
 | `R`   | Rotate the camera feed 90° clockwise + re-calibrate (always allowed; releases and re-takes the lock) | 🔄 Rotate [R] button |
+| `1` / `2` | +1 point Team A (P1·P2) / Team B (P3·P4) | +1 Team A [1] / +1 Team B [2]     |
+| `0`   | Reset the score (0 : 0, games 0-0)            | Reset score [0]                  |
 | `S`   | Start / stop MP4 recording                    | –                                |
 | `X`   | Reset player stats                            | –                                |
 | `Q`   | Quit                                          | –                                |
@@ -170,6 +225,8 @@ while the camera reconnects.
   `POST /api/calibration/lock {"locked": true}`
 - **Camera:** `POST /api/camera/exposure {"mode": "auto|sport|toggle"}` · `POST /api/camera/settings` ·
   `POST /api/failover`
+- **Score:** `GET /api/score` · `POST /api/score/point {"team": "A|B"}` · `POST /api/score/undo` ·
+  `POST /api/score/reset` · `POST /api/score/auto {"enabled": true}` (also in `/api/telemetry` → `score`)
 - **Mobile portal:** `GET /mobile-camera` · `GET /api/qr.png` · `GET /api/mobile/pair` (same-LAN token) · `GET /api/mobile/status` · `WS /ws/mobile-cam`
 - **Reports:** `GET /api/report.json|csv|html`
 - **Docs:** interactive docs at `/api/docs`
@@ -179,4 +236,7 @@ while the camera reconnects.
 ```bat
 python padeliq_live_stream.py --source sim --test-run 100
 python padeliq_live_stream.py --source sim --test-run 300 --test-stage-keys --test-failover
+python padeliq_live_stream.py --source sim --test-run 320 --test-score
 ```
+
+`--test-score` presses `1`, `1`, `2`, checks the score, and saves `scoreboard_verified.jpg`.

@@ -879,16 +879,22 @@ class CourtGeometryAI:
 
         for idx in idxs:
             f = frames[int(idx)]
-            boxes, kps_list, confs = self.pose.detect(f, conf=0.25, max_pose_crops=6)
+            # Full-frame person pass: a stale / wrong court ROI must never blind calibration to the real players
+            saved_roi, self.pose.roi = getattr(self.pose, "roi", None), None
+            try:
+                boxes, kps_list, confs = self.pose.detect(f, conf=0.25, max_pose_crops=6)
+            finally:
+                self.pose.roi = saved_roi
             frame_boxes = []
             for b, kp, cf in zip(boxes, kps_list, confs):
                 x1, y1, x2, y2 = [float(v) for v in b[:4]]
                 bh, bw = y2 - y1, x2 - x1
+                if bh >= 0.06 * h and bw >= 6.0 and y2 >= 0.16 * h:
+                    frame_boxes.append((x1, y1, x2, y2))     # player-guided court validation (incl. far pair)
                 if bh < 0.08 * h or bw < 8.0 or y2 < 0.28 * h:
                     continue
                 foot_xy, method, _, ank_list = pose_ground_point(b, kp, f.shape)
                 fx, fy = foot_xy
-                frame_boxes.append((x1, y1, x2, y2))
                 cx_norm = 1.0 - min(0.85, abs(fx - 0.5 * w) / (0.62 * w))
                 y_norm = float(np.clip((fy - 0.22 * h) / (0.78 * h), 0.1, 1.0))
                 wt = float((bh / h) ** 2 * (0.35 + 0.65 * y_norm) * (0.4 + 0.6 * cx_norm) * float(cf))
@@ -902,6 +908,38 @@ class CourtGeometryAI:
         return ankle_seeds, all_person_boxes
 
     @staticmethod
+    def foreground_occluder_y(bg_bgr):
+        band = CourtGeometryAI.foreground_occluder_band(bg_bgr)
+        return None if band is None else band[0]
+
+    @staticmethod
+    def foreground_occluder_band(bg_bgr):
+        """Top row of a wide dark horizontal foreground band in the lower frame (balcony railing, hand rail,
+        camera-mount bar) or None. Pixels below it are hidden or belong to a walkway in front of the court, so
+        the court floor is treated as ending there (instead of at the image bottom)."""
+        h, w = bg_bgr.shape[:2]
+        hsv = cv2.cvtColor(bg_bgr, cv2.COLOR_BGR2HSV)
+        V, S = hsv[:, :, 2], hsv[:, :, 1]
+        # near-black pixels have unstable chroma (sensor noise -> any saturation), so very dark always counts
+        dark = ((V < 62) & ((S < 110) | (V < 36))).astype(np.float32)
+        frac = cv2.blur(dark.mean(axis=1).reshape(-1, 1), (1, 3)).ravel()
+        run_min = max(6, int(round(0.012 * h)))
+        y0, y1 = int(0.50 * h), int(0.97 * h)
+        run = 0
+        for y in range(y0, y1):
+            run = run + 1 if frac[y] > 0.62 else 0
+            if run >= run_min:
+                top = y - run + 1
+                if top <= int(0.52 * h):
+                    return None
+                # band bottom: last row of the railing structure (rails + balusters: >= 35 % dark)
+                bot = y
+                while bot + 1 < h and frac[bot + 1] > 0.35:
+                    bot += 1
+                return int(top), int(bot)
+        return None
+
+    @staticmethod
     def _tophat_white(gray, scale=1.0):
         ksz = max(9, int(round(19 * scale)) | 1)
         kern = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ksz, ksz))
@@ -912,6 +950,10 @@ class CourtGeometryAI:
         from walls, ceilings, sky, curtains, and adjacent background/side courts."""
         h, w = bg_bgr.shape[:2]
         scale = h / 720.0
+        occ_y = self.foreground_occluder_y(bg_bgr)
+        if occ_y is not None and ankle_seeds:
+            # feet hidden behind a foreground railing put "ankle" keypoints ON the railing: never learn its colour
+            ankle_seeds = [sd for sd in ankle_seeds if sd[1] < occ_y - 0.01 * h]
         lab = cv2.cvtColor(bg_bgr, cv2.COLOR_BGR2LAB)
         hsv = cv2.cvtColor(bg_bgr, cv2.COLOR_BGR2HSV)
         gray = cv2.cvtColor(bg_bgr, cv2.COLOR_BGR2GRAY)
@@ -920,6 +962,13 @@ class CourtGeometryAI:
 
         tophat = self._tophat_white(gray, scale)
         not_line_or_dark = (tophat < 22) & (V_ch > 38) & ~((S_ch < 35) & (V_ch > 200))
+        # Colour SAMPLES come from a 5x5 median (thin mesh-fence wires removed): feet standing behind a wire-mesh
+        # cage must teach the turf colour, not the wire-darkened turf. Classification still uses the full image.
+        smp = cv2.medianBlur(bg_bgr, 5)
+        lab_s = cv2.cvtColor(smp, cv2.COLOR_BGR2LAB).astype(np.float32)
+        hsv_s = cv2.cvtColor(smp, cv2.COLOR_BGR2HSV).astype(np.float32)
+        Ls, As, Bs = lab_s[:, :, 0], lab_s[:, :, 1], lab_s[:, :, 2]
+        Hs, Ss = hsv_s[:, :, 0], hsv_s[:, :, 1]
 
         patch_L, patch_A, patch_B, patch_H, patch_S, patch_W = [], [], [], [], [], []
         if ankle_seeds:
@@ -936,11 +985,11 @@ class CourtGeometryAI:
                 if len(ys_s) > 80:
                     pick = np.linspace(0, len(ys_s) - 1, 80).astype(int)
                     ys_s, xs_s = ys_s[pick], xs_s[pick]
-                patch_L.append(L[y0:y1, x0:x1][ys_s, xs_s])
-                patch_A.append(A[y0:y1, x0:x1][ys_s, xs_s])
-                patch_B.append(B[y0:y1, x0:x1][ys_s, xs_s])
-                patch_H.append(H_ch[y0:y1, x0:x1][ys_s, xs_s])
-                patch_S.append(S_ch[y0:y1, x0:x1][ys_s, xs_s])
+                patch_L.append(Ls[y0:y1, x0:x1][ys_s, xs_s])
+                patch_A.append(As[y0:y1, x0:x1][ys_s, xs_s])
+                patch_B.append(Bs[y0:y1, x0:x1][ys_s, xs_s])
+                patch_H.append(Hs[y0:y1, x0:x1][ys_s, xs_s])
+                patch_S.append(Ss[y0:y1, x0:x1][ys_s, xs_s])
                 patch_W.append(np.full(len(ys_s), wt, dtype=np.float32))
 
         line_roi = np.zeros((h, w), dtype=bool)
@@ -955,11 +1004,11 @@ class CourtGeometryAI:
                 pick = np.linspace(0, len(fy_idx) - 1, min(400, len(fy_idx))).astype(int)
                 fy_idx, fx_idx = fy_idx[pick], fx_idx[pick]
                 med_w = float(np.median(np.concatenate(patch_W))) if patch_W else 1.0
-                patch_L.append(L[fy_idx, fx_idx])
-                patch_A.append(A[fy_idx, fx_idx])
-                patch_B.append(B[fy_idx, fx_idx])
-                patch_H.append(H_ch[fy_idx, fx_idx])
-                patch_S.append(S_ch[fy_idx, fx_idx])
+                patch_L.append(Ls[fy_idx, fx_idx])
+                patch_A.append(As[fy_idx, fx_idx])
+                patch_B.append(Bs[fy_idx, fx_idx])
+                patch_H.append(Hs[fy_idx, fx_idx])
+                patch_S.append(Ss[fy_idx, fx_idx])
                 patch_W.append(np.full(len(fy_idx), med_w * 0.9, dtype=np.float32))
 
         if not patch_A:
@@ -969,11 +1018,11 @@ class CourtGeometryAI:
             if len(ys_s) > 0:
                 pick = np.linspace(0, len(ys_s) - 1, min(500, len(ys_s))).astype(int)
                 ys_s, xs_s = ys_s[pick], xs_s[pick]
-                patch_L.append(L[y0:y1, x0:x1][ys_s, xs_s])
-                patch_A.append(A[y0:y1, x0:x1][ys_s, xs_s])
-                patch_B.append(B[y0:y1, x0:x1][ys_s, xs_s])
-                patch_H.append(H_ch[y0:y1, x0:x1][ys_s, xs_s])
-                patch_S.append(S_ch[y0:y1, x0:x1][ys_s, xs_s])
+                patch_L.append(Ls[y0:y1, x0:x1][ys_s, xs_s])
+                patch_A.append(As[y0:y1, x0:x1][ys_s, xs_s])
+                patch_B.append(Bs[y0:y1, x0:x1][ys_s, xs_s])
+                patch_H.append(Hs[y0:y1, x0:x1][ys_s, xs_s])
+                patch_S.append(Ss[y0:y1, x0:x1][ys_s, xs_s])
                 patch_W.append(np.ones(len(ys_s), dtype=np.float32))
 
         sL = np.concatenate(patch_L)
@@ -1028,6 +1077,23 @@ class CourtGeometryAI:
         )
         raw_floor[:int(0.12 * h), :] = False
 
+        # Wire-mesh cage fences in front of the floor: 1-3 px dark wires over turf. A 5x5 median removes the wires,
+        # so the turf behind them classifies as floor again. Only between 0.30 H and a foreground railing (never
+        # the background court at the top, never the walkway below a railing).
+        mesh_y0 = int(0.30 * h)
+        mesh_y1 = occ_y if occ_y is not None else h
+        if mesh_y1 - mesh_y0 > 20:
+            mb = cv2.medianBlur(bg_bgr[mesh_y0:mesh_y1], 5)
+            lab_m = cv2.cvtColor(mb, cv2.COLOR_BGR2LAB).astype(np.float32)
+            hsv_m = cv2.cvtColor(mb, cv2.COLOR_BGR2HSV).astype(np.float32)
+            Lm, Am, Bm = lab_m[:, :, 0], lab_m[:, :, 1], lab_m[:, :, 2]
+            dhm = np.abs(hsv_m[:, :, 0] - mu_H)
+            dhm = np.minimum(dhm, 180.0 - dhm)
+            d_abm = np.sqrt(((Am - mu_A) / sig_A) ** 2 + ((Bm - mu_B) / sig_B) ** 2)
+            behind_mesh = ((d_abm < 2.65) & (dhm < hue_tol) & (hsv_m[:, :, 1] >= 0.8 * min_sat)
+                           & (Lm >= max(30.0, min_L_strict - 0.6 * sig_L)) & (Lm <= min(248.0, mu_L + 2.4 * sig_L)))
+            raw_floor[mesh_y0:mesh_y1] |= behind_mesh
+
         # Bridge thin painted white court lines sitting ON the floor, EXCEPT do NOT bridge across a
         # full-width horizontal white net headband tape (keeps adjacent back courts cleanly disconnected!)
         dil_floor = cv2.dilate(raw_floor.astype(np.uint8), np.ones((7, 7), np.uint8)) > 0
@@ -1044,6 +1110,20 @@ class CourtGeometryAI:
         # (`width <= 12 px`) while having ZERO vertical reach across horizontal back-wall curbs!
         k_horiz_post = cv2.getStructuringElement(cv2.MORPH_RECT, (max(13, int(19 * scale) | 1), 3))
         cleaned = cv2.morphologyEx(cleaned, cv2.MORPH_CLOSE, k_horiz_post)
+        # Vertical bridge across thin / medium dark HORIZONTAL obstructions in front of the floor (wire-mesh cage
+        # wires, structural bars, hand rails): 15x45 then 7x25 closing. Restricted to the lower 70 % of the frame
+        # so it can never reach up into a distant background court, and never bridges INTO the rows below a
+        # detected foreground railing (the walkway strip under a balcony rail is not the court).
+        y_lo = int(0.30 * h)
+        y_hi = occ_y if occ_y is not None else h
+        if y_hi - y_lo > 40:
+            band = cleaned[y_lo:y_hi]
+            for kw, kh in ((15, 45), (7, 25)):
+                kv = cv2.getStructuringElement(cv2.MORPH_RECT, (max(3, int(kw * scale) | 1), max(5, int(kh * scale) | 1)))
+                band = cv2.morphologyEx(band, cv2.MORPH_CLOSE, kv)
+            cleaned[y_lo:y_hi] = band
+        if occ_y is not None:
+            cleaned[occ_y:] = 0                       # floor ends at the railing: nothing below it is the court
         cleaned = cv2.morphologyEx(cleaned, cv2.MORPH_OPEN, k_open)
 
         n_cc, labels, stats, centroids = cv2.connectedComponentsWithStats(cleaned, connectivity=8)
@@ -1051,13 +1131,20 @@ class CourtGeometryAI:
             mask = cleaned
         else:
             cc_scores = np.zeros(n_cc, dtype=np.float64)
+            floor_bot = occ_y if occ_y is not None else h
             for cid in range(1, n_cc):
                 area = float(stats[cid, cv2.CC_STAT_AREA])
                 if area < 0.015 * h * w:
                     continue
                 cy = centroids[cid][1]
-                y_bot = stats[cid, cv2.CC_STAT_TOP] + stats[cid, cv2.CC_STAT_HEIGHT]
-                score = area * (0.30 + 0.70 * (cy / h)) * (1.4 if y_bot > 0.68 * h else 0.65)
+                span = stats[cid, cv2.CC_STAT_HEIGHT]
+                y_bot = stats[cid, cv2.CC_STAT_TOP] + span
+                # A padel court seen from any usable camera spans >= 28 % of the frame height; a thin strip
+                # hugging the bottom edge (walkway under a railing, balcony floor) is never the court.
+                plausible = span >= 0.28 * h and cy <= 0.82 * h
+                score = area * (0.30 + 0.70 * (cy / h)) * (1.4 if y_bot > 0.68 * floor_bot else 0.65)
+                if not plausible:
+                    score *= 1e-3
                 if ankle_seeds:
                     ank_bonus = 0.0
                     for ax, ay, wt, _ in ankle_seeds:
@@ -1105,6 +1192,7 @@ class CourtGeometryAI:
         ys_on = np.where(mask > 0)[0]
         top_y = int(ys_on.min()) if len(ys_on) else int(0.35 * h)
         floor_meta = {
+            "occluder_y": occ_y,
             "lab_median": [round(mu_L, 1), round(mu_A, 1), round(mu_B, 1)],
             "court_hue": int(round(mu_H)),
             "court_sat": round(mu_S, 1),
@@ -1128,7 +1216,7 @@ class CourtGeometryAI:
         return (dx / dy < 0.14) and (abs(xm - 0.5 * w) > 0.12 * w)
 
     @classmethod
-    def _extract_segments(cls, bg_bgr, floor_mask, tophat):
+    def _extract_segments(cls, bg_bgr, floor_mask, tophat, y_bot=None):
         h, w = bg_bgr.shape[:2]
         scale = h / 720.0
         hsv = cv2.cvtColor(bg_bgr, cv2.COLOR_BGR2HSV)
@@ -1169,6 +1257,8 @@ class CourtGeometryAI:
             edge_img[h - b_pad:, :] = 0
             edge_img[:, :b_pad] = 0
             edge_img[:, w - b_pad:] = 0
+            if y_bot is not None and y_bot < h:          # floor boundary along a foreground railing = occlusion edge
+                edge_img[max(0, y_bot - 3 * b_pad):, :] = 0
             raw_bnd = cv2.HoughLinesP(
                 edge_img, 1.0, np.pi / 360.0,
                 threshold=max(20, int(26 * scale)),
@@ -1455,7 +1545,8 @@ class CourtGeometryAI:
         span_w = max(1, x_hi - x_lo)
 
         white_tape = ((V_ch > 172) & (S_ch < 65)).astype(np.uint8) * 255
-        y_min_s = max(int(0.22 * h), floor_top_y - int(0.06 * h))
+        # Elevated cameras (balcony) see the net tape as high as ~0.15 H: follow the floor top, not a fixed row
+        y_min_s = max(int(0.10 * h), min(int(0.22 * h), floor_top_y + int(0.04 * h)), floor_top_y - int(0.06 * h))
         y_max_s = int(y_svc_limit - 0.10 * h) if y_svc_limit is not None else int(0.68 * h)
         y_max_s = min(y_max_s, h - 35)
         if y_max_s - y_min_s < 25:
@@ -1672,7 +1763,8 @@ class CourtGeometryAI:
 
     def _solve_low_baseline_candidate(self, bg_bgr, floor_mask, tophat, vp_long, cl_long, vp_trans, cl_trans, floor_top_y, ankle_seeds):
         h, w = bg_bgr.shape[:2]
-        bot_cov = float(np.mean(floor_mask[h - 10:, :] > 0))
+        y_bot = int(getattr(self, "_y_bot", h) or h)    # image bottom, or the top of a foreground railing
+        bot_cov = float(np.mean(floor_mask[max(0, y_bot - 14):max(1, y_bot - 4), :] > 0))
         if bot_cov < 0.42:
             return None
 
@@ -1682,7 +1774,7 @@ class CourtGeometryAI:
             if cl["white_len"] < 0.22 * w or abs(cl["ray"][1]) < 0.35:
                 continue
             y_mid = -(cl["ray"][0] * (0.5 * w) + cl["ray"][2]) / cl["ray"][1]
-            if 0.54 * h < y_mid < 0.985 * h:
+            if 0.54 * h * (y_bot / h) ** 0.5 < y_mid < y_bot - 0.015 * h:
                 svc_cands.append((cl["white_len"], y_mid, cl))
         if not svc_cands:
             return None
@@ -1729,7 +1821,7 @@ class CourtGeometryAI:
         # Direct side-wall / floor-edge search between `band_y` and `y_svc_mid`
         hsv = cv2.cvtColor(bg_bgr, cv2.COLOR_BGR2HSV)
         ra = max(0, int(net_info["band_y_mid"] + 4))
-        rb = min(h - 4, int(y_svc_mid - 10))
+        rb = min(y_bot - 4, int(y_svc_mid - 10))
         if rb - ra > 16:
             for ch in (hsv[:, :, 1], hsv[:, :, 2], floor_mask):
                 edges = cv2.Canny(cv2.GaussianBlur(ch, (5, 5), 0), 18, 55)
@@ -1934,6 +2026,9 @@ class CourtGeometryAI:
             & (grid_px[:, 0] >= 0) & (grid_px[:, 0] < w)
             & (grid_px[:, 1] >= 0) & (grid_px[:, 1] < h)
         )
+        y_bot = int(getattr(self, "_y_bot", h) or h)
+        if y_bot < h:
+            vis &= grid_px[:, 1] < y_bot - 2            # hidden behind a foreground railing: unknown, not "off floor"
         if np.count_nonzero(vis) < 25:
             return -1e9, {}
         vx = grid_px[vis, 0].astype(int)
@@ -1970,7 +2065,7 @@ class CourtGeometryAI:
             ts = np.linspace(0.05, 0.95, 40)[:, None]
             lp = project_pts(H_c2i, np.array(p0) * (1.0 - ts) + np.array(p1) * ts)
             for x, y in lp:
-                if np.isfinite(x) and np.isfinite(y) and 3 <= x < w - 3 and max(3, floor_top_y - 6) <= y < h - 3:
+                if np.isfinite(x) and np.isfinite(y) and 3 <= x < w - 3 and max(3, floor_top_y - 6) <= y < y_bot - 3:
                     tot += 1
                     hit += int(near_ridge[int(y), int(x)] > 0)
         line_sup = (hit / tot) if tot >= 12 else 0.0
@@ -2077,12 +2172,21 @@ class CourtGeometryAI:
         hull = cv2.convexHull(max(cnts, key=cv2.contourArea)).reshape(-1, 2).astype(np.float32)
         if len(hull) < 4:
             return None
-        s = hull[:, 0] + hull[:, 1]
-        d = hull[:, 0] - hull[:, 1]
-        tl = hull[int(np.argmin(s))]
-        br = hull[int(np.argmax(s))]
-        tr = hull[int(np.argmax(d))]
-        bl = hull[int(np.argmin(d))]
+        # Corners from the top / bottom bands of the hull (not x+y extremes): when the floor runs off the image
+        # sides, the x+y extreme lands mid-height on the frame edge and the quad would lose the far court.
+        dense = []
+        for (x0, y0), (x1, y1) in zip(hull, np.roll(hull, -1, axis=0)):
+            n = max(2, int(np.hypot(x1 - x0, y1 - y0) // 4))
+            dense.append(np.column_stack([np.linspace(x0, x1, n), np.linspace(y0, y1, n)]))
+        pts = np.vstack(dense)
+        y_top, y_bot = float(pts[:, 1].min()), float(pts[:, 1].max())
+        band = max(4.0, 0.06 * (y_bot - y_top))
+        top = pts[pts[:, 1] <= y_top + band]
+        bot = pts[pts[:, 1] >= y_bot - band]
+        tl, tr = top[int(np.argmin(top[:, 0]))], top[int(np.argmax(top[:, 0]))]
+        bl, br = bot[int(np.argmin(bot[:, 0]))], bot[int(np.argmax(bot[:, 0]))]
+        if tr[0] - tl[0] < 8 or br[0] - bl[0] < 8:
+            return None
         corners = np.array([tl, tr, br, bl], dtype=np.float32)
         H_i2c = compute_homography(corners)
         if H_i2c is None:
@@ -2111,16 +2215,18 @@ class CourtGeometryAI:
         # Fast single-frame provisional seed runs pure LAB+HSV + 2-VP in ~35ms (zero lock contention);
         # full 15-frame convergence runs 2 pose passes (~0.8-1.3s total!)
         if fast_single:
-            ankle_seeds = []
+            ankle_seeds, person_boxes = [], []
         else:
-            ankle_seeds, _ = self.extract_player_ankle_seeds(valid_frames, max_pose_frames=min(2, len(valid_frames)))
+            ankle_seeds, person_boxes = self.extract_player_ankle_seeds(valid_frames, max_pose_frames=min(2, len(valid_frames)))
 
         floor_mask, tophat, floor_meta = self.segment_primary_floor(bg, ankle_seeds)
         floor_top_y = floor_meta["floor_top_y"]
         if floor_meta["floor_area_pct"] < 4.0:
             return None, "no primary court floor surface visible in frame"
+        occ_y = floor_meta.get("occluder_y")
+        self._y_bot = int(occ_y) if occ_y is not None else h
 
-        segs, _ = self._extract_segments(bg, floor_mask, tophat)
+        segs, _ = self._extract_segments(bg, floor_mask, tophat, y_bot=self._y_bot)
         vp_res = self._ransac_two_vps(segs, bg.shape)
 
         candidates = []
@@ -2172,6 +2278,21 @@ class CourtGeometryAI:
                 return None, "insufficient court lines on segmented floor"
             candidates.append((fb[0], fb[1], fb[2], None, None))
 
+        # Candidate gates + player-guided validation: the visible court must span >= 28 % of the frame height,
+        # must not sit in the bottom 18 % (walkway under a railing), and the real court contains the players.
+        feet = self._player_feet(person_boxes, h, w)
+        gated = []
+        for cand in candidates:
+            vis = self.visible_court_extent(cand[1], (h, w), self._y_bot)
+            if vis is None or vis[1] < 0.28 * h or vis[0] > 0.82 * h:
+                continue
+            frac = self._feet_inside(cand[1], feet)
+            cand[2]["players_inside_pct"] = None if frac is None else round(100.0 * frac, 1)
+            gated.append((cand[0] + (0.0 if frac is None else 0.22 * frac), cand[1], cand[2], cand[3], cand[4]))
+        if not gated:
+            return None, "no court-sized floor region (only strips at the frame edge)"
+        candidates = gated
+
         best_sc, corners, meta, vp_long, vp_trans = max(candidates, key=lambda c: c[0])
 
         H_i2c_init = compute_homography(corners)
@@ -2198,7 +2319,10 @@ class CourtGeometryAI:
 
         info = dict(floor_meta)
         info.update(meta)
+        band = self.foreground_occluder_band(bg) if occ_y is not None else None
         info.update({
+            "floor_bottom_y": None if occ_y is None else int(occ_y),
+            "occluder_bottom_y": None if band is None else int(band[1]),
             "method": f"court_geometry_ai_{meta.get('solver_mode', 'vp')}",
             "engine": "CourtGeometryAI (Surface + 2-VP RANSAC + Pose-Ankle Hull)",
             "angle": angle_label,
@@ -2217,14 +2341,100 @@ class CourtGeometryAI:
         self.last_info = info
         return corners.astype(np.float32), info
 
+    @staticmethod
+    def visible_court_extent(corners, frame_shape, y_bot=None):
+        """(centroid_y, vertical_span) of the court polygon clipped to the visible frame (above y_bot)."""
+        h, w = frame_shape[:2]
+        yb = float(h if y_bot is None else y_bot)
+        quad = np.asarray(corners, np.float32).reshape(-1, 2)
+        if not np.all(np.isfinite(quad)):
+            return None
+        quad = np.clip(quad, -50.0 * max(h, w), 50.0 * max(h, w))
+        if cv2.contourArea(quad) < 0:
+            quad = quad[::-1].copy()
+        frame = np.array([[0, 0], [w, 0], [w, yb], [0, yb]], np.float32)
+        try:
+            area, inter = cv2.intersectConvexConvex(np.ascontiguousarray(quad), frame)
+        except cv2.error:
+            return None
+        if inter is None or area <= 1.0:
+            return None
+        pts = inter.reshape(-1, 2)
+        m = cv2.moments(pts.astype(np.float32))
+        cy = m["m01"] / m["m00"] if abs(m["m00"]) > 1e-6 else float(pts[:, 1].mean())
+        return float(cy), float(np.ptp(pts[:, 1]))
+
+    @staticmethod
+    def _player_feet(person_boxes, h, w):
+        """Foot points of person boxes from the calibration pass that sit in the playing band (y 18-75 %+)."""
+        feet = []
+        for _, boxes in person_boxes or []:
+            for x1, y1, x2, y2 in boxes:
+                bh = y2 - y1
+                fy = y2
+                if bh >= 0.08 * h and 0.18 * h <= fy <= 0.80 * h:
+                    feet.append((0.5 * (x1 + x2), fy))
+        return feet
+
+    @staticmethod
+    def _feet_inside(corners, feet):
+        if len(feet) < 2:
+            return None
+        H = compute_homography(corners)
+        if H is None:
+            return None
+        cm = project_pts(H, feet)
+        ok = (np.isfinite(cm[:, 0]) & np.isfinite(cm[:, 1]) & (cm[:, 0] >= -0.8) & (cm[:, 0] <= COURT_WIDTH_M + 0.8)
+              & (cm[:, 1] >= -1.0) & (cm[:, 1] <= COURT_LENGTH_M + 1.5))
+        return float(np.mean(ok))
+
     # ------------------------------------------------------------------
     # Stage D: Strict Main-Court Pose-Ankle Player Filtering
     # ------------------------------------------------------------------
+    # Court envelope for a tracked player's foot point (court metres): side / back glass rebound margins
+    PLAYER_X_RANGE_M = (-1.2, COURT_WIDTH_M + 1.2)
+    PLAYER_Y_RANGE_M = (-1.5, COURT_LENGTH_M + 1.5)
+    PLAYER_ASPECT = (1.15, 4.2)            # box h / w without a skeleton (posts are thinner, benches squatter)
+
     @staticmethod
-    def filter_main_court_players(boxes, kps_list, H_i2c, frame_shape, floor_mask=None, floor_top_y=None):
+    def valid_human_skeleton(kp, box):
+        """True / False when pose keypoints exist for this box, None when there is no skeleton to judge.
+        A real person shows a shoulder above a hip with a plausible torso, plus a knee or ankle below the hip;
+        a dark balcony post, glass strut or bag yields no such structure."""
+        if kp is None:
+            return None
+        kp = np.asarray(kp, np.float32)
+        if kp.shape[0] < 17 or float(np.max(kp[:, 2])) <= 0.0:
+            return None
+        bh = max(1.0, float(box[3] - box[1]))
+        ok = kp[:, 2] > 0.35
+        sh = [i for i in (5, 6) if ok[i]]
+        hp = [i for i in (11, 12) if ok[i]]
+        legs = [i for i in (13, 14, 15, 16) if ok[i]]
+        if not sh or not hp:
+            return False
+        y_sh = float(np.mean(kp[sh, 1]))
+        y_hp = float(np.mean(kp[hp, 1]))
+        torso = y_hp - y_sh
+        if torso < 0.12 * bh or torso > 0.62 * bh:
+            return False
+        if legs and float(np.max(kp[legs, 1])) < y_hp:
+            return False
+        if len(sh) == 2 and len(hp) == 2:      # left/right symmetry: shoulder and hip widths agree in scale
+            ws, wh = abs(kp[5, 0] - kp[6, 0]), abs(kp[11, 0] - kp[12, 0])
+            if max(ws, wh) > 6.0 * max(4.0, min(ws, wh)):
+                return False
+        return bool(legs) or int(np.count_nonzero(ok)) >= 7
+
+    @staticmethod
+    def filter_main_court_players(boxes, kps_list, H_i2c, frame_shape, floor_mask=None, floor_top_y=None,
+                                  occluder_y=None, occluder_bottom_y=None):
         if H_i2c is None or boxes is None or len(boxes) == 0:
             return []
         h, w = frame_shape[:2]
+        x_lo, x_hi = CourtGeometryAI.PLAYER_X_RANGE_M
+        y_lo, y_hi = CourtGeometryAI.PLAYER_Y_RANGE_M
+        a_lo, a_hi = CourtGeometryAI.PLAYER_ASPECT
         dil_floor = None
         if floor_mask is not None and floor_mask.shape[:2] == (h, w):
             k = max(15, int(round(23 * h / 720.0)) | 1)
@@ -2242,26 +2452,49 @@ class CourtGeometryAI:
                 continue
 
             kp = kps_list[i] if (kps_list is not None and i < len(kps_list)) else None
+            # Real human structure: a skeleton must look human; without one the box shape must
+            aspect = bh / max(1.0, bw)
+            skel = CourtGeometryAI.valid_human_skeleton(kp, box)
+            if skel is False or aspect > a_hi:
+                continue
+            if skel is None and aspect < a_lo:
+                continue
+            # In front of a foreground railing (balcony post, spectator on the walkway): a player behind the
+            # railing has the feet hidden BY it, so the box never extends past the railing's bottom edge.
+            if occluder_y is not None:
+                rail_bot = occluder_bottom_y if occluder_bottom_y is not None else occluder_y + 0.06 * h
+                if y2 > rail_bot + 0.015 * h:
+                    continue
+
             foot_xy, method, sig_px, _ = pose_ground_point(box, kp, frame_shape)
             fx, fy = foot_xy
+            feet_hidden = occluder_y is not None and fy >= occluder_y - 0.01 * h
 
             pos_m = project_pts(H_i2c, [[fx, fy]])[0]
             if not np.all(np.isfinite(pos_m)):
                 continue
             xm, ym = float(pos_m[0]), float(pos_m[1])
 
-            # Strict physical 3D court bounds (`10m x 20m` + glass rebound margin for standing players)
-            aspect = bh / max(1.0, bw)
-            min_ym = -0.95 if (0.35 <= xm <= COURT_WIDTH_M - 0.35 and aspect >= 1.55 and bh >= 0.105 * h) else -0.58
-            if not (-0.60 <= xm <= COURT_WIDTH_M + 0.60 and min_ym <= ym <= COURT_LENGTH_M + 1.15):
+            # Court envelope (`10m x 20m` + glass rebound margins). Sideways a player may run out through the side
+            # openings (x -1.2 .. 11.2 m, foot on the turf); behind the BACK glass there is no playing area, so
+            # lengthwise only the pose-ground tolerance applies (-0.95 m for an upright player at the glass).
+            if not (x_lo <= xm <= x_hi and y_lo <= ym <= y_hi):
                 continue
+            min_ym = -0.95 if (0.35 <= xm <= COURT_WIDTH_M - 0.35 and aspect >= 1.55 and bh >= 0.105 * h) else -0.58
+            if not (min_ym <= ym <= COURT_LENGTH_M + 1.15):
+                continue
+            inner = -0.60 <= xm <= COURT_WIDTH_M + 0.60
 
-            # Primary floor mask containment check when foot is inside the image frame
-            if dil_floor is not None and 2 <= fx < w - 2 and 2 <= fy < h - 2:
+            # Primary floor mask containment check when foot is inside the image frame (and not behind a railing)
+            on_floor = None
+            if dil_floor is not None and 2 <= fx < w - 2 and 2 <= fy < h - 2 and not feet_hidden:
                 ix, iy = int(round(fx)), int(round(fy))
-                if dil_floor[iy, ix] == 0:
-                    if not (0.25 <= xm <= COURT_WIDTH_M - 0.25 and min_ym <= ym <= 0.40):
+                on_floor = dil_floor[iy, ix] > 0
+                if not on_floor:
+                    if not (inner and 0.25 <= xm <= COURT_WIDTH_M - 0.25 and min_ym <= ym <= 0.40):
                         continue
+            if not inner and not on_floor:
+                continue
 
             # Reject seated spectators behind back glass (squat aspect or tiny height near `ym ~ 0`)
             if ym < 1.35 and (bh / max(1.0, bw) < 1.32 or bh < 0.092 * h):
@@ -2290,12 +2523,8 @@ class CourtGeometryAI:
                 if peers and c["bh"] < 0.48 * max(peers):
                     raw_cands.remove(c)
 
-        far_c = sorted(
-            [c for c in raw_cands if c["far_side"]],
-            key=lambda c: -c["bh"] + 8.0 * max(0.0, abs(c["pos_m"][0] - 5.0) - 4.5)
-        )[:3]
-        near_c = sorted(
-            [c for c in raw_cands if not c["far_side"]],
-            key=lambda c: -c["bh"] + 8.0 * max(0.0, abs(c["pos_m"][0] - 5.0) - 4.5)
-        )[:3]
+        def _rank(c):
+            return -c["bh"] + 8.0 * max(0.0, abs(c["pos_m"][0] - 5.0) - 4.5)
+        far_c = sorted([c for c in raw_cands if c["far_side"]], key=_rank)[:3]
+        near_c = sorted([c for c in raw_cands if not c["far_side"]], key=_rank)[:3]
         return far_c + near_c

@@ -41,6 +41,7 @@ echo   [Q] Quit
 echo ----------------------------------------------------------
 echo   Desktop keys: [C] calibrate [L] lock [R] rotate 90 [E] shutter [F] fullscreen
 echo                 [F12] failover [M] QR portal [S] record [X] reset [Q] quit
+echo   Score:        [1] +1 Team A (P1-P2)  [2] +1 Team B (P3-P4)  [0] reset score
 echo ==========================================================
 set "CHOICE="
 set /p "CHOICE=Select an option: "

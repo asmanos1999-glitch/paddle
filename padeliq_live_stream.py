@@ -51,6 +51,7 @@ from scipy.optimize import linear_sum_assignment
 
 import court_geometry_ai as CG
 import padeliq_orientation as ORI
+import padeliq_score as SC
 
 # Never crash on console encoding (Windows cp1252 consoles, redirected output).
 for _stream in (sys.stdout, sys.stderr):
@@ -1783,7 +1784,7 @@ class LivePlayerState:
             self.avg_speed_ms = self.distance_m / self.tracked_seconds_total
 
         gx = int(np.clip(self.smoothed_pos_m[0], 0, 9.99))
-        half_y = self.smoothed_pos_m[1] if self.slot_id in (1, 2) else (self.smoothed_pos_m[1] - 10.0)
+        half_y = self.smoothed_pos_m[1] if self.slot_id in FAR_SLOTS else (self.smoothed_pos_m[1] - 10.0)
         gy = int(np.clip(half_y, 0, 9.99))
         for dx in (-1, 0, 1):
             for dy in (-1, 0, 1):
@@ -1819,23 +1820,49 @@ class LivePlayerState:
         return self.smoothed_pos_m is not None and (now - self.last_seen_time) < window
 
 
+NEAR_SLOTS = (1, 2)                 # Team A: P1 near-left, P2 near-right (court y >= 10 m, camera side)
+FAR_SLOTS = (3, 4)                  # Team B: P3 far-left,  P4 far-right  (court y <  10 m)
+TEAM_SLOTS = {"A": NEAR_SLOTS, "B": FAR_SLOTS}
+
+
 class LiveSlotManager:
+    FULL_FRAME_AFTER_S = 1.5        # fewer than 4 court players for this long -> periodic full-frame passes
+    FULL_FRAME_EVERY_S = 1.0
+
     def __init__(self, homography_matrix):
         self.H = homography_matrix
         self.floor_mask = None
         self.floor_top_y = None
+        self.occluder_y = None              # top / bottom row of a foreground railing (balcony cameras)
+        self.occluder_bottom_y = None
+        self.last_candidates = 0
+        self._short_since = None
+        self._last_full = 0.0
         self.reset_players()
 
     def reset_players(self):
-        anchors = {1: (2.5, 4.5), 2: (7.5, 4.5), 3: (2.5, 15.5), 4: (7.5, 15.5)}
+        # Team A = near half (P1 near-left, P2 near-right), Team B = far half (P3 far-left, P4 far-right).
+        # Left / right only seeds the first assignment; Hungarian matching then keeps each identity.
+        anchors = {1: (2.5, 15.5), 2: (7.5, 15.5), 3: (2.5, 4.5), 4: (7.5, 4.5)}
         self.players = {sid: LivePlayerState(sid, anchors[sid]) for sid in (1, 2, 3, 4)}
 
-    def set_homography(self, H, floor_mask=None, floor_top_y=None):
+    def set_homography(self, H, floor_mask=None, floor_top_y=None, floor_bottom_y=None, occluder_bottom_y=None):
         self.H = H
         if floor_mask is not None:
             self.floor_mask = floor_mask
+            self.occluder_y, self.occluder_bottom_y = floor_bottom_y, occluder_bottom_y
         if floor_top_y is not None:
             self.floor_top_y = floor_top_y
+
+    def wants_full_frame(self, now):
+        """True when the court-ROI detector has been short of the 4 players for a while: the next inference
+        should look at the whole frame once (a wrong / stale ROI can never blind the tracker for long)."""
+        if self.H is None or self._short_since is None:
+            return False
+        if now - self._short_since < self.FULL_FRAME_AFTER_S or now - self._last_full < self.FULL_FRAME_EVERY_S:
+            return False
+        self._last_full = now
+        return True
 
     def pixel_to_meters(self, px_pt):
         if self.H is None:
@@ -1857,18 +1884,21 @@ class LiveSlotManager:
 
     def update_detections(self, boxes, now=None, keypoints=None, frame_shape=None):
         """Strict main-court pose-ankle player filtering + true 3D Homography net team assignment:
-          - Rejects bystanders, wall posters, seated spectators, and adjacent-court players.
-          - Assigns `P1, P2` (Far Side: `y_m < 10.0m`) and `P3, P4` (Near Side: `y_m >= 10.0m`)
-            strictly through the 3D Homography matrix `H`, so oblique 30-45 deg angles assign teams accurately!"""
-        if self.H is None or boxes is None or len(boxes) == 0:
-            return
+          - Rejects bystanders, wall posters, seated spectators, balcony posts, walkway spectators in front of a
+            railing, and adjacent-court players.
+          - Team A `P1, P2` = near half (`y_m >= 10.0m`), Team B `P3, P4` = far half (`y_m < 10.0m`), strictly
+            through the 3D Homography matrix `H`, so oblique 30-45 deg angles assign teams accurately."""
         now = time.time() if now is None else float(now)
+        if self.H is None or boxes is None or len(boxes) == 0:
+            self._note_candidates(0, now)
+            return
         candidates = []
 
         if frame_shape is not None:
             filtered = CG.CourtGeometryAI.filter_main_court_players(
                 boxes, keypoints, self.H, frame_shape,
                 floor_mask=self.floor_mask, floor_top_y=self.floor_top_y,
+                occluder_y=self.occluder_y, occluder_bottom_y=self.occluder_bottom_y,
             )
             for item in filtered:
                 fx, fy = item["foot_px"]
@@ -1894,6 +1924,7 @@ class LiveSlotManager:
                     far_side = bool(pos_m[1] < NET_Y_M)
                     candidates.append(((x1, y1, x2, y2), foot_px, pos_m, (sx, sy), far_side))
 
+        self._note_candidates(len(candidates), now)
         if not candidates:
             return
 
@@ -1904,7 +1935,7 @@ class LiveSlotManager:
             for c, (_, _, pos_m, _, far_side) in enumerate(candidates):
                 dist = float(np.linalg.norm(pos_m - pl.last_pos_m))
                 penalty = 0.0
-                if (sid in (1, 2)) != far_side:          # never assign across the 3D net (`y_m = 10.0m`)
+                if (sid in FAR_SLOTS) != far_side:       # never assign across the 3D net (`y_m = 10.0m`)
                     penalty = 1e6
                 since = now - pl.last_seen_time
                 if pl.smoothed_pos_m is not None and since < 1.2:
@@ -1920,6 +1951,13 @@ class LiveSlotManager:
             if cost[r, c] < max_cost:
                 box, foot_px, pos_m, sig, _ = candidates[c]
                 pl.update(box, foot_px, pos_m, now, meas_sigma=sig)
+
+    def _note_candidates(self, n, now):
+        self.last_candidates = n
+        if n >= 4:
+            self._short_since = None
+        elif self._short_since is None:
+            self._short_since = now
 
 
 
@@ -3132,6 +3170,7 @@ def draw_compact_header(frame, s, fps_val, source_label, now=None):
         cv2.circle(im, (int(11 * s), bh // 2), max(3, int(4 * s)), (60, 220, 60), -1, cv2.LINE_AA)
         put_text(im, text, (int(22 * s), th + int(8 * s)), 0.5 * s, (235, 235, 235), 1, s)
     composite_patch(frame, x1, y1, hud_patch("compact_header", text, (bw, bh), paint, (10, 10, 10)), 0.82)
+    return (x1, y1, x1 + bw, y1 + bh)
 
 
 def draw_reconnect_banner(frame, now, s, detail=""):
@@ -3198,10 +3237,89 @@ def draw_toast(frame, s, text):
         im, text, (int(16 * s), th + int(11 * s)), 0.6 * s, (255, 255, 255), 2, s), (20, 20, 20), (0, 255, 180)), 0.85)
 
 
+TEAM_COLOR = {"A": (60, 200, 255), "B": (255, 170, 80)}       # BGR: Team A amber, Team B sky blue
+GOLD = (40, 200, 255)
+
+
+def _draw_trophy(im, x, y, size, color):
+    """Small trophy pictogram (cup, handles, stem, base) - OpenCV fonts have no emoji."""
+    r = size / 2.0
+    t = max(1, int(round(size / 9)))
+    cv2.ellipse(im, (int(x + r), int(y + 0.30 * size)), (int(0.34 * size), int(0.30 * size)), 0, 0, 180, color, -1, cv2.LINE_AA)
+    cv2.rectangle(im, (int(x + 0.16 * size), int(y)), (int(x + 0.84 * size), int(y + 0.32 * size)), color, -1)
+    for sx in (-1, 1):
+        cv2.ellipse(im, (int(x + r + sx * 0.36 * size), int(y + 0.22 * size)), (int(0.14 * size), int(0.14 * size)),
+                    0, -90 if sx > 0 else 90, 90 if sx > 0 else 270, color, t, cv2.LINE_AA)
+    cv2.rectangle(im, (int(x + 0.44 * size), int(y + 0.56 * size)), (int(x + 0.56 * size), int(y + 0.80 * size)), color, -1)
+    cv2.rectangle(im, (int(x + 0.24 * size), int(y + 0.80 * size)), (int(x + 0.76 * size), int(y + 0.95 * size)), color, -1)
+
+
+def draw_scoreboard(frame, score, now, s, x_lo=None, x_hi=None, y=None, center=None):
+    """Top-centre broadcast scoreboard: TEAM A [P1-P2]  15 : 30  TEAM B [P3-P4] / Games | Points | Rally,
+    plus a gold 'POINT TEAM X!' badge for a few seconds after every point. Returns its rect."""
+    if score is None:
+        return (0, 0, 0, 0)
+    h, w = frame.shape[:2]
+    x_lo = int(12 * s) if x_lo is None else int(x_lo)
+    x_hi = w - int(12 * s) if x_hi is None else int(x_hi)
+    y = int(12 * s) if y is None else int(y)
+    st = score.state(now)                            # cheap; the rendered patch is cached by its content
+    pa, pb = st["points"]["A"], st["points"]["B"]
+    left = f"{SC.TEAM_LABEL['A']} [{SC.TEAM_PLAYERS['A']}]"
+    right = f"{SC.TEAM_LABEL['B']} [{SC.TEAM_PLAYERS['B']}]"
+    mid = f"{pa} : {pb}"
+    sub = (f"Games {st['games']['A']}-{st['games']['B']}  |  Points {st['total']['A']}-{st['total']['B']}  |  "
+           f"Rally: {st['rally_shots']} shots{'  |  AUTO' if st['auto'] else ''}")
+    avail = max(120, x_hi - x_lo)
+    k = 1.0
+    for _ in range(8):                               # shrink to fit between the coach panel and the minimap
+        tw = (text_width(left, 0.5 * s * k, 1) + text_width(right, 0.5 * s * k, 1)
+              + text_width(mid, 0.95 * s * k, 2) + int(64 * s * k))
+        if tw <= avail and text_width(sub, 0.4 * s * k, 1) + int(24 * s * k) <= avail:
+            break
+        k *= 0.9
+    tl, tm, tr = (text_width(left, 0.5 * s * k, 1), text_width(mid, 0.95 * s * k, 2), text_width(right, 0.5 * s * k, 1))
+    pad = int(16 * s * k)
+    bw = max(tl + tm + tr + 4 * pad, text_width(sub, 0.4 * s * k, 1) + 2 * pad)
+    bh = int(62 * s * k)
+    cx0 = (x_lo + x_hi) // 2 if center is None else int(center)
+    x1 = int(np.clip(min(cx0 - bw // 2, x_hi - bw), max(0, x_lo), max(0, w - bw)))
+
+    def paint(im):
+        row = int(30 * s * k)
+        cx = bw // 2
+        put_text(im, mid, (cx - tm // 2, row + int(4 * s * k)), 0.95 * s * k, (255, 255, 255), 2, s)
+        put_text(im, left, (cx - tm // 2 - pad - tl, row), 0.5 * s * k, TEAM_COLOR["A"], 1, s)
+        put_text(im, right, (cx + tm // 2 + pad, row), 0.5 * s * k, TEAM_COLOR["B"], 1, s)
+        if st["owner"] and st["rally_active"]:        # rally indicator: who has to play the ball
+            ox = cx - tm // 2 - pad // 2 if st["owner"] == "A" else cx + tm // 2 + pad // 2
+            cv2.circle(im, (ox, row - int(6 * s * k)), max(2, int(3 * s * k)), TEAM_COLOR[st["owner"]], -1, cv2.LINE_AA)
+        ts = text_width(sub, 0.4 * s * k, 1)
+        put_text(im, sub, (cx - ts // 2, int(52 * s * k)), 0.4 * s * k, (200, 200, 200), 1, s)
+    sig = (left, mid, right, sub, st["owner"], st["rally_active"], round(s * k, 3), bw)
+    composite_patch(frame, x1, y, hud_patch("scoreboard", sig, (bw, bh), paint, (12, 12, 12), (90, 90, 90)), 0.84)
+    rect = (x1, y, x1 + bw, y + bh)
+
+    lp = score.flash(now)
+    if lp:
+        text = f"POINT {SC.TEAM_LABEL[lp['team']]}!" + ("  GAME!" if lp.get("game") else "")
+        (tw, th), _ = cv2.getTextSize(text, FONT, 0.75 * s, 2)
+        icon = int(26 * s)
+        fw, fh = tw + icon + int(40 * s), th + int(24 * s)
+        fx = int(np.clip(x1 + bw // 2 - fw // 2, 0, max(0, w - fw)))
+
+        def paint_flash(im):
+            _draw_trophy(im, int(14 * s), (fh - icon) // 2, icon, GOLD)
+            put_text(im, text, (icon + int(24 * s), th + int(12 * s)), 0.75 * s, GOLD, 2, s)
+        composite_patch(frame, fx, rect[3] + int(8 * s),
+                        hud_patch("score_flash", (text, round(s, 3)), (fw, fh), paint_flash, (10, 10, 10), GOLD), 0.9)
+    return rect
+
+
 def render_live_hud(frame, slot_mgr, corners_px, fps_val, H=None, source_label="LIVE",
                     recording=False, rec_seconds=0.0, reconnecting=False, reconnect_detail="",
                     hud_mode="full", ball=None, review=None, web=False, now=None,
-                    held=False, locked=False, toast=""):
+                    held=False, locked=False, toast="", score=None):
     """
     Draws the PadelIQ HUD in place. Works for any resolution (scales from 720p).
     hud_mode="full": coach panel + minimap + stat cards (desktop).
@@ -3219,7 +3337,8 @@ def render_live_hud(frame, slot_mgr, corners_px, fps_val, H=None, source_label="
     if hud_mode == "compact":
         if slot_mgr is not None:
             draw_compact_tags(frame, slot_mgr, now, s)
-        draw_compact_header(frame, s, fps_val, source_label, now)
+        hdr = draw_compact_header(frame, s, fps_val, source_label, now)
+        draw_scoreboard(frame, score, now, s, x_hi=hdr[0] - int(12 * s) if hdr else None, center=w // 2)
         draw_calibration_review(frame, review, now, s, web=web)
         draw_ball_hud(frame, ball, now, s)                    # ball on top of every other layer
         rects = {"coach": (0, 0, 0, 0), "minimap": (w, 0, w, 0)}
@@ -3230,9 +3349,13 @@ def render_live_hud(frame, slot_mgr, corners_px, fps_val, H=None, source_label="
             mini_rect = (w, 0, w, 0)
         coach_rect = draw_coach_panel(frame, slot_mgr, now, s, fps_val, source_label, recording, rec_seconds,
                                       max_w=mini_rect[0] - int(32 * s))
+        obstacles = [coach_rect, mini_rect]
+        if score is not None:
+            sb = draw_scoreboard(frame, score, now, s, x_lo=coach_rect[2] + int(12 * s), x_hi=mini_rect[0] - int(12 * s))
+            obstacles.append((sb[0], sb[1], sb[2], sb[3] + int(60 * s)))    # + room for the point badge
         if slot_mgr is not None:
-            # Stat cards are placed so they never cover the panels or each other.
-            draw_player_cards(frame, slot_mgr, now, s, [coach_rect, mini_rect])
+            # Stat cards are placed so they never cover the panels, the scoreboard or each other.
+            draw_player_cards(frame, slot_mgr, now, s, obstacles)
         draw_calibration_review(frame, review, now, s, web=web)
         draw_ball_hud(frame, ball, now, s, obstacles=[coach_rect, mini_rect])      # on top of everything
         rects = {"coach": coach_rect, "minimap": mini_rect}
@@ -3320,6 +3443,8 @@ class PersonDetector:
         self.last_keypoints = []
         self.pose_det = CG.PoseCourtDetector(app_dir=APP_DIR, model_path=model_path, imgsz=imgsz, conf=conf,
                                              backend=backend)
+        self.full_frame_next = False        # set by the slot manager when the court ROI is short of players
+        self.full_frame_passes = 0
         self.pose_det.POSE_STRIDE = max(1, int(pose_stride))
         self.pose_det.adaptive_pose = self.pose_det.POSE_STRIDE > 1
         self.model = self.pose_det.det_model or self.pose_det.pose_model
@@ -3352,6 +3477,11 @@ class PersonDetector:
         self.last_keypoints = []
         if not self.pose_det.ready:
             return np.zeros((0, 4), dtype=np.float32)
+        saved_roi = None
+        if self.full_frame_next and self.pose_det.roi is not None:
+            saved_roi, self.pose_det.roi = self.pose_det.roi, None
+            self.full_frame_passes += 1
+        self.full_frame_next = False
         try:
             boxes, kps, _ = self.pose_det.detect(frame, conf=self.conf)
             self.last_balls = self.pose_det.last_balls
@@ -3362,6 +3492,9 @@ class PersonDetector:
             if self._errors <= 3:
                 log(f"Detection error (frame skipped): {exc!r}")
             return np.zeros((0, 4), dtype=np.float32)
+        finally:
+            if saved_roi is not None and self.pose_det.roi is None:
+                self.pose_det.roi = saved_roi
 
 
 # =====================================================================
@@ -3437,6 +3570,8 @@ class LiveSession:
         self.calib_frames = deque(maxlen=24)
         self._last_calib_grab = 0.0
         self.ball = PadelBallTracker()
+        self.score = SC.PadelScoreEngine()
+        self.score.listeners.append(self._on_point)
         self.last_boxes = np.zeros((0, 4), np.float32)
         self.last_yolo_balls = np.zeros((0, 4), np.float32)
         self.last_kps = []
@@ -3490,6 +3625,11 @@ class LiveSession:
         elif rv.state == "failed":
             self.pending_autolock = False
             self.toast("Court not found - press [R] to rotate or [C] to drag corners", 3.5)
+
+    def _on_point(self, ev):
+        st = ev["score"]
+        log(f"POINT {SC.TEAM_LABEL[ev['team']]} ({'auto: ' + ev['reason'] if ev['auto'] else 'manual'}) -> "
+            f"{st['points']['A']} : {st['points']['B']} | Games {st['games']['A']}-{st['games']['B']}")
 
     # --------------------------------------------------------- stage helpers
     def toast(self, msg, secs=2.2):
@@ -3630,7 +3770,8 @@ class LiveSession:
                 ai = get_court_ai()
                 self.corners, self.H = rv.corners.copy(), H
                 self.slot_mgr.set_homography(
-                    H, floor_mask=ai.last_floor_mask, floor_top_y=rv.info.get("floor_top_y", ai.last_floor_top_y)
+                    H, floor_mask=ai.last_floor_mask, floor_top_y=rv.info.get("floor_top_y", ai.last_floor_top_y),
+                    floor_bottom_y=rv.info.get("floor_bottom_y"), occluder_bottom_y=rv.info.get("occluder_bottom_y")
                 )
                 if rv.drag_idx is None and not rv.info.get("provisional"):
                     self.slot_mgr.reset_players()
@@ -3683,6 +3824,13 @@ class LiveSession:
         if ch == "l":
             self.set_lock(not self.calib_locked)
             return
+        if ch in ("1", "2"):                    # instant manual score override (always allowed)
+            self.score.point("A" if ch == "1" else "B", reason=f"manual [{ch}]")
+            return
+        if ch == "0":
+            self.score.reset()
+            self.toast("Score reset: 0 : 0 | Games 0-0")
+            return
         if ch == "e":
             if cam is None or cam.kind != "webcam":
                 self.toast("Exposure control applies to USB webcams")
@@ -3723,7 +3871,8 @@ class LiveSession:
         if ch == "r":                       # always allowed: rotating invalidates the geometry -> re-lock after
             self.calib_locked = False
             new = ORI.norm_deg(self.rotation + 90)
-            upright = self.last_raw is None or                 ORI.orientation_score(ORI.landscape(self.last_raw, new))[0] >= ORI.MIN_CONF
+            upright = self.last_raw is None or \
+                ORI.orientation_score(ORI.landscape(self.last_raw, new))[0] >= ORI.MIN_CONF
             self.set_rotation(new, auto_lock=self.spec.kind == "mobile" and upright, why="[R]")
             if not upright:                  # never auto-lock a court that looks sideways / upside down
                 self.toast(f"Rotated to {new} deg - court does not look upright: press [R] again or [A] to auto-orient", 3.5)
@@ -3790,6 +3939,8 @@ class AsyncAIWorker:
                         s.last_kps, s.last_det_ts = self.detector.last_keypoints, ts
                         s.slot_mgr.update_detections(boxes, now=ts, keypoints=self.detector.last_keypoints,
                                                      frame_shape=canvas.shape)
+                        if s.slot_mgr.wants_full_frame(ts):
+                            self.detector.full_frame_next = True
                 self.inferred += 1
                 now = time.time()
                 self._times.append(now)
@@ -4008,7 +4159,7 @@ def run_live_padeliq(args):
         cv2.setMouseCallback(win_name, lambda ev, x, y, fl, pa: session.review.on_mouse(ev, x, y))
         log("Live engine running:  [Enter] confirm court  [C] drag corners  [A] re-scan  [L] lock calibration  "
             "[E] auto exposure / sport shutter  [K] camera driver settings  [F] fullscreen  [F12] failover  "
-            "[M] mobile QR portal  [R] rotate 90  [X] reset stats  [S] record  [Q] quit")
+            "[M] mobile QR portal  [R] rotate 90  [1]/[2] +1 Team A/B  [0] reset score  [X] reset stats  [S] record  [Q] quit")
 
     # Scripted key presses exercise the same handlers headlessly during --test-run.
     scripted_keys = {}
@@ -4026,6 +4177,9 @@ def run_live_padeliq(args):
         if args.test_rotate:                   # unlock, rotate 90 (pillarboxed, un-stretched), auto-orient back
             scripted_keys[max(10, (n * 2) // 5)] = ord('r')
             scripted_keys[max(11, n // 2)] = ord('a')
+        if args.test_score:                    # manual overrides: +A, +A, +B, then the flash screenshot
+            scripted_keys.update({max(12, (n * 11) // 20): ord('1'), max(13, (n * 23) // 40): ord('1'),
+                                  max(14, (n * 3) // 5): ord('2')})
 
     processed = 0                       # frames processed by the AI worker
     displayed = 0                       # camera frames shown in the window
@@ -4041,6 +4195,7 @@ def run_live_padeliq(args):
     captured = False
     captured_ball = False
     rot_shot_due = None
+    score_shot_due = None
 
     try:
         while not session.quit:
@@ -4135,13 +4290,15 @@ def run_live_padeliq(args):
                         detail = f"No frames for {cam.seconds_since_frame:.1f}s | attempt #{max(1, cam.reconnect_count)}"
                 else:
                     detail = ""
+                if slot_mgr is not None and session.review.state == "confirmed" and not degraded:
+                    session.score.update_from_ball(session.ball)
                 render_live_hud(hud, slot_mgr, corners, ai.rate, H=session.H, source_label=spec.label,
                                 recording=session.recorder.active, rec_seconds=session.recorder.seconds,
                                 reconnecting=degraded, reconnect_detail=detail,
                                 ball=session.ball if last_canvas is not None else None,
                                 review=session.review if last_canvas is not None else None,
                                 held=last_canvas is not None, locked=session.calib_locked,
-                                toast=session.toast_text())
+                                toast=session.toast_text(), score=session.score)
             if cam.kind == "mobile" and cam.waiting_for_phone:
                 # QR pairing screen until the phone streams (PIL text -> rebuilt at 2 Hz, then reused)
                 MBm, hub_m = mobile["MB"], mobile["hub"]
@@ -4161,7 +4318,7 @@ def run_live_padeliq(args):
                 act = {sid: p for sid, p in session.slot_mgr.players.items()
                        if p.is_active(now_c, 0.5) and p.smoothed_pos_m is not None}
                 sides_ok = len(act) == 4 and all(
-                    (sid in (1, 2)) == (float(p.smoothed_pos_m[1]) < NET_Y_M)
+                    (sid in FAR_SLOTS) == (float(p.smoothed_pos_m[1]) < NET_Y_M)
                     for sid, p in act.items())
                 if sides_ok:
                     cv2.imwrite(args.capture_verified, hud)
@@ -4178,6 +4335,10 @@ def run_live_padeliq(args):
                 captured_ball = True
                 log(f"[verify] saved {os.path.basename(args.capture_ball)}: ball {session.ball.speed_kmh:.0f} km/h, "
                     f"trail {len(session.ball.trail)} pts, shots {session.ball.shots}, court {session.ball.court_pos}")
+            if score_shot_due is not None and processed >= score_shot_due:
+                score_shot_due = None
+                cv2.imwrite(os.path.join(APP_DIR, "scoreboard_verified.jpg"), hud)
+                log(f"[test] scoreboard frame -> scoreboard_verified.jpg | {session.score.banner_text()}")
             if rot_shot_due is not None and processed >= rot_shot_due:
                 rot_shot_due = None
                 cv2.imwrite(os.path.join(APP_DIR, "rotate_test_verified.jpg"), hud)
@@ -4199,6 +4360,8 @@ def run_live_padeliq(args):
                     key = scripted_keys.pop(due[0])
                     if key == ord('r'):
                         rot_shot_due = processed + 25
+                    if key == ord('2') and args.test_score:
+                        score_shot_due = processed + 2
                     log(f"[test] simulating key '{'F12' if key in F12_KEYS else chr(key).upper()}' at frame {processed}")
 
             was_recording = session.recorder.active
@@ -4294,6 +4457,12 @@ def run_live_padeliq(args):
         log(f"[test] players tracked: {active or 'none'} | source: {spec.label} | calibration: "
             f"{session.review.state} ({session.review.info.get('method')}, {session.review.info.get('confidence_pct')}%) "
             f"| ball visible {session.ball.state()['visibility_pct']}% of ball frames, {session.ball.total_shots} shots")
+        st = session.score.state()
+        log(f"[test] score: {session.score.banner_text()} | total points A {st['total']['A']} B {st['total']['B']}"
+            f" | last {st['last_point']}")
+        if args.test_score and (st["total"]["A"] < 2 or st["total"]["B"] < 1):
+            log("[test] FAILED: manual [1] / [2] score overrides were not applied")
+            exit_code = 1
         log("[test] SMOKE TEST PASSED" if exit_code == 0 else "[test] SMOKE TEST FAILED")
     return exit_code
 
@@ -4366,6 +4535,8 @@ def build_arg_parser():
     p.add_argument("--test-stage-keys", action="store_true", help="--test-run also presses [L], [A] (refused), [E]")
     p.add_argument("--test-failover", action="store_true", help="--test-run also presses [F12] twice")
     p.add_argument("--test-qr", action="store_true", help="--test-run also presses [M]; a phone must then stream")
+    p.add_argument("--test-score", action="store_true",
+                   help="--test-run also presses [1] [1] [2] (manual score) and saves scoreboard_verified.jpg")
     p.add_argument("--test-rotate", action="store_true", help="--test-run also presses [R] (rotate 90) then [A] (auto-orient)")
     p.add_argument("--capture-verified", default="", metavar="PATH",
                    help="save the first frame with confirmed calibration, 4 players on correct sides and the ball visible")

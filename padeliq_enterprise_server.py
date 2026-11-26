@@ -58,6 +58,7 @@ import padeliq_live_stream as E
 import court_geometry_ai as CG
 import padeliq_mobile_bridge as MB
 import padeliq_orientation as ORI
+import padeliq_score as SC
 
 try:
     import psutil
@@ -183,6 +184,8 @@ class PadelIQEngine:
         self.calib_frames = deque(maxlen=24)
         self._last_calib_grab = 0.0
         self.ball = E.PadelBallTracker()
+        self.score = SC.PadelScoreEngine()
+        self.score.listeners.append(self._on_point)
         self.last_boxes = np.zeros((0, 4), np.float32)
         self.last_yolo_balls = np.zeros((0, 4), np.float32)
         self.last_kps = []
@@ -224,6 +227,19 @@ class PadelIQEngine:
         return run
 
     # ---------------------------------------------------------------- source
+    def _on_point(self, ev):
+        st, now = ev["score"], ev["t"]
+        line = (f"POINT {SC.TEAM_LABEL[ev['team']]}!{' GAME!' if ev.get('game') else ''}  "
+                f"{st['points']['A']} : {st['points']['B']} | Games {st['games']['A']}-{st['games']['B']}")
+        log(line + (f" (auto: {ev['reason']})" if ev["auto"] else " (manual)"))
+        self.coach_feed.appendleft({
+            "t": round(now, 2), "time": datetime.fromtimestamp(now).strftime("%H:%M:%S"),
+            "session_s": round(now - self.session_started_at, 1), "player": "SCORE",
+            "text": line + (" - auto" if ev["auto"] else " - manual"), "speed_ms": None, "stability_pct": None})
+
+    def score_point(self, team):
+        return self.score.point(team, reason="web +1")
+
     def toast(self, msg, secs=2.5):
         self._toast = (msg, time.time() + secs)
         log(msg)
@@ -525,7 +541,8 @@ class PadelIQEngine:
                 ai = E.get_court_ai()
                 self.corners, self.H = rv.corners.copy(), H
                 self.slot_mgr.set_homography(
-                    H, floor_mask=ai.last_floor_mask, floor_top_y=rv.info.get("floor_top_y", ai.last_floor_top_y)
+                    H, floor_mask=ai.last_floor_mask, floor_top_y=rv.info.get("floor_top_y", ai.last_floor_top_y),
+                    floor_bottom_y=rv.info.get("floor_bottom_y"), occluder_bottom_y=rv.info.get("occluder_bottom_y")
                 )
                 if rv.drag_idx is None and not rv.info.get("provisional"):
                     self.slot_mgr.reset_players()
@@ -689,6 +706,8 @@ class PadelIQEngine:
                         self.slot_mgr.update_detections(
                             boxes, now=ts, keypoints=self.detector.last_keypoints, frame_shape=canvas.shape
                         )
+                        if self.slot_mgr.wants_full_frame(ts):
+                            self.detector.full_frame_next = True
                 self.frames_inferred += 1
                 self.infer_meter.tick()
             except Exception as exc:
@@ -752,6 +771,8 @@ class PadelIQEngine:
                     have_geo = last_canvas is not None and self.canvas_shape == last_canvas.shape[:2]
                     if have_geo:
                         self._sync_review()
+                        if self.review.state == "confirmed" and not degraded:
+                            self.score.update_from_ball(self.ball)
                     E.render_live_hud(hud, self.slot_mgr if have_geo else None, self.corners if have_geo else None,
                                       self.infer_meter.rate, H=self.H,
                                       source_label=self.spec.label if self.spec else "starting",
@@ -759,7 +780,7 @@ class PadelIQEngine:
                                       ball=self.ball if have_geo else None,
                                       review=self.review if have_geo else None, web=True,
                                       held=last_canvas is not None, locked=self.calib_locked,
-                                      toast=self.toast_text())
+                                      toast=self.toast_text(), score=self.score)
                 # Encoded once per render tick; every MJPEG viewer / projector tab shares these bytes.
                 ok, buf = cv2.imencode(".jpg", hud, self._jpeg_params)
                 if ok:
@@ -880,7 +901,7 @@ class PadelIQEngine:
         return {"t": round(now, 3), "session_s": round(now - self.session_started_at, 1),
                 "players": players, "heatmap": heat, "coach_feed": list(self.coach_feed)[:30],
                 "ball": self.ball.state(now), "calibration_review": self.review.status(),
-                "status": self.status()}
+                "score": self.score.state(now), "status": self.status()}
 
     def status(self):
         cam = self.cam
@@ -1304,6 +1325,44 @@ def create_app(engine):
             return {"ok": True, **engine.set_exposure(str(body.get("mode", "toggle")))}
         except Exception as exc:
             return err(str(exc))
+
+    @app.get("/api/score")
+    def score_get():
+        return engine.score.state()
+
+    @app.post("/api/score/point")
+    async def score_point(request: Request):
+        """{"team": "A"} (+1 Team A = P1/P2) or {"team": "B"} (+1 Team B = P3/P4)."""
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        try:
+            ev = engine.score_point(str((body or {}).get("team", "")).upper())
+            return {"ok": True, "team": ev["team"], "game": ev["game"], "score": ev["score"]}
+        except Exception as exc:
+            return err(str(exc))
+
+    @app.post("/api/score/reset")
+    def score_reset():
+        engine.score.reset()
+        engine.toast("Score reset: 0 : 0 | Games 0-0")
+        return {"ok": True, "score": engine.score.state()}
+
+    @app.post("/api/score/undo")
+    def score_undo():
+        ok = engine.score.undo()
+        return {"ok": ok, "score": engine.score.state()} if ok else err("nothing to undo")
+
+    @app.post("/api/score/auto")
+    async def score_auto(request: Request):
+        """{"enabled": true|false} automatic point detection from the ball tracker."""
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        engine.score.auto = bool((body or {}).get("enabled", not engine.score.auto))
+        return {"ok": True, "auto": engine.score.auto}
 
     @app.post("/api/camera/rotate")
     async def camera_rotate(request: Request):
