@@ -89,7 +89,17 @@ button.small{min-height:36px;padding:7px 12px;font-size:13px;border-radius:999px
 "use strict";
 const $ = s => document.querySelector(s);
 const video = $("#video"), ov = $("#ov"), ctx = ov.getContext("2d"), hudImg = $("#hud");
-const TOKEN = new URLSearchParams(location.search).get("k") || "";
+const QS = new URLSearchParams(location.search);
+let TOKEN = QS.get("k") || QS.get("token") || "";
+async function ensureToken(){            // opened without ?k= -> fetch the active token (same-LAN only)
+  if(TOKEN) return true;
+  try{ const r = await fetch("/api/mobile/pair", {cache:"no-store"}); const j = await r.json();
+    if(r.ok && j.token){ TOKEN = j.token; QS.set("k", TOKEN); QS.delete("token");
+      history.replaceState(null, "", location.pathname + "?" + QS.toString()); return true; }
+  }catch(e){}
+  return false;
+}
+ensureToken();
 const JPEG_Q = 0.72, TARGET_FPS = 30, MAX_IN_FLIGHT = 2, MAX_BUFFERED = 65536;
 let SEND_LONG_EDGE = 1280;            // adaptive: 1280 <-> 960 from the measured ack round-trip
 const rtts = [], sendT = [];
@@ -376,7 +386,7 @@ $("#b-start").addEventListener("click", async () => {
   const err = $("#err"); err.textContent = "";
   if(!window.isSecureContext || !navigator.mediaDevices || !navigator.mediaDevices.getUserMedia){
     err.textContent = "Camera access needs HTTPS. Open the https:// link from the QR code (accept the local certificate warning)."; return; }
-  if(!TOKEN){ err.textContent = "Missing pairing token - scan the QR code on the PadelIQ screen again."; return; }
+  if(!(await ensureToken())){ err.textContent = "Could not pair with PadelIQ - join the same Wi-Fi as the stage PC and scan its QR code."; return; }
   goFullscreen(); keepAwake();
   try{ await useStream(await openCamera()); await buildLenses(); }
   catch(e){ err.textContent = (e && e.name === "NotAllowedError") ? "Camera permission was denied. Allow camera access for this site and try again."

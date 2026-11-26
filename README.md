@@ -41,7 +41,7 @@ python padeliq_live_stream.py --source mobile      :: phone camera via QR code
 1. Start either engine. The HTTPS portal starts on port 8443. A self-signed `certs/cert.pem` +
    `certs/key.pem` pair is generated on first run for the LAN IP. `certs/` is git-ignored.
 2. Show the QR code:
-   - **Web:** click **📱 Mobile QR Portal** in the Source card (or press `M`).
+   - **Web:** click **📱 Mobile QR Portal** in the top header bar (or press `M`).
    - **Desktop:** press `M` for the QR overlay, or start with `--source mobile` to fill the window with the
      pairing screen.
 3. Scan it with the phone (same Wi-Fi). Accept the local certificate once (`getUserMedia` needs HTTPS on a
@@ -61,6 +61,11 @@ Transport details:
 - **Flow control:** at most 2 frames in flight and `ws.bufferedAmount < 64 KB`, with a server ACK per
   decoded frame.
 - **Weak Wi-Fi:** the phone drops to 540p after 2 s of slow ACKs and returns to 720p when they recover.
+
+The QR uses the IP of the real Wi-Fi/Ethernet adapter. Virtual adapters (VMware, Hyper-V vEthernet, WSL,
+VirtualBox, VPN) and link-local addresses are skipped by adapter name. Override with `--lan-ip` or
+`PADELIQ_LAN_IP`. A phone on the same LAN can also type `https://<LAN_IP>:8443/mobile-camera` without the
+token; the page then fetches it from `/api/mobile/pair`, which only answers private-network clients.
 
 If Windows Firewall asks, allow Python on private networks so the phone can reach port 8443.
 
@@ -144,7 +149,7 @@ while the camera reconnects.
   `POST /api/calibration/lock {"locked": true}`
 - **Camera:** `POST /api/camera/exposure {"mode": "auto|sport|toggle"}` · `POST /api/camera/settings` ·
   `POST /api/failover`
-- **Mobile portal:** `GET /mobile-camera` · `GET /api/qr.png` · `GET /api/mobile/status` · `WS /ws/mobile-cam`
+- **Mobile portal:** `GET /mobile-camera` · `GET /api/qr.png` · `GET /api/mobile/pair` (same-LAN token) · `GET /api/mobile/status` · `WS /ws/mobile-cam`
 - **Reports:** `GET /api/report.json|csv|html`
 - **Docs:** interactive docs at `/api/docs`
 

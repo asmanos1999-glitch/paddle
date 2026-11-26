@@ -70,37 +70,83 @@ def _is_private_v4(ip):
         return False
 
 
+VIRTUAL_NIC_RE = re.compile(
+    r"vmware|vmnet|virtualbox|vbox|hyper-?v|vethernet|wsl|docker|default switch|loopback|pseudo|"
+    r"\btap\b|tap-|\btun\b|wireguard|openvpn|vpn|zerotier|tailscale|hamachi|npcap|bluetooth|teredo|isatap", re.I)
+WIFI_NIC_RE = re.compile(r"wi-?fi|wlan|wireless|802\.11", re.I)
+LAN_ADAPTER = ""                                # name of the adapter chosen for the QR (for the log)
+
+
+def _route_ip():
+    """Source IP the OS would use for the default route (UDP connect to 8.8.8.8:80; no packet is sent)."""
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(("8.8.8.8", 80))
+            return s.getsockname()[0]
+    except OSError:
+        return ""
+
+
+def _lan_adapters():
+    """[(name, ipv4)] of adapters that are up, private, not loopback / link-local (169.254)."""
+    try:
+        import psutil
+        stats = psutil.net_if_stats()
+        out = []
+        for name, addrs in psutil.net_if_addrs().items():
+            st = stats.get(name)
+            if st is not None and not st.isup:
+                continue
+            for a in addrs:
+                if a.family == socket.AF_INET and _is_private_v4(a.address):
+                    out.append((name, a.address))
+        return out
+    except Exception:
+        return []
+
+
 def get_lan_ip(override=None):
-    """IPv4 of the adapter that carries the default route (no packet is actually sent).
-    Falls back to any private address of this host, then 127.0.0.1."""
+    """IPv4 the phone should use to reach this PC.
+    1. --lan-ip / PADELIQ_LAN_IP override.
+    2. The default-route adapter (UDP connect to 8.8.8.8:80) - unless it is a virtual NIC.
+    3. Otherwise the best real adapter: VMware / Hyper-V vEthernet / WSL / VirtualBox / VPN / link-local (169.254)
+       / loopback are skipped; Wi-Fi beats Ethernet, then 192.168.* > 10.* > 172.16-31.*.
+    Adapters are filtered by NAME, not by subnet: many venue / campus Wi-Fi networks use 172.16-31.x, while VMware's
+    host-only adapters use 192.168.x.1."""
+    global LAN_ADAPTER
+    override = override or os.environ.get("PADELIQ_LAN_IP", "").strip()
     if override:
+        LAN_ADAPTER = "override"
         return override
-    candidates = []
-    for probe in ("8.8.8.8", "10.255.255.255", "192.168.1.1"):
-        try:
-            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
-                s.connect((probe, 1))
-                ip = s.getsockname()[0]
-            if _is_private_v4(ip):
-                # The default-route adapter is the real Wi-Fi/Ethernet; virtual NICs (VMware, Hyper-V,
-                # VirtualBox host-only 192.168.x.1) never carry the default route.
+    route = _route_ip()
+    adapters = _lan_adapters()
+    real = [(n, ip) for n, ip in adapters if not VIRTUAL_NIC_RE.search(n)]
+    if adapters:
+        for n, ip in real:
+            if ip == route:
+                LAN_ADAPTER = n
                 return ip
-            if ip and not ip.startswith("127."):
-                candidates.append(ip)
-        except OSError:
-            continue
+
+        def rank(item):
+            n, ip = item
+            net = 0 if ip.startswith("192.168.") else (1 if ip.startswith("10.") else 2)
+            return (0 if WIFI_NIC_RE.search(n) else 1, net, ip.endswith(".1"))
+        if real:
+            LAN_ADAPTER, ip = sorted(real, key=rank)[0]
+            return ip
+    if _is_private_v4(route):                   # psutil unavailable: trust the default route
+        LAN_ADAPTER = "default route"
+        return route
     try:
         for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
-            candidates.append(info[4][0])
+            ip = info[4][0]
+            if _is_private_v4(ip) and not ip.endswith(".1"):
+                LAN_ADAPTER = "hostname"
+                return ip
     except OSError:
         pass
-    for ip in candidates:                       # no default route (offline hotspot): skip x.x.x.1 host-only NICs
-        if _is_private_v4(ip) and not ip.endswith(".1"):
-            return ip
-    for ip in candidates:
-        if _is_private_v4(ip):
-            return ip
-    return candidates[0] if candidates else "127.0.0.1"
+    LAN_ADAPTER = "loopback"
+    return "127.0.0.1"
 
 
 def _cert_covers(cert_path, ip):
@@ -335,6 +381,7 @@ class MobileHub:
 
     def __init__(self, https_port=MOBILE_HTTPS_PORT, lan_ip=None, token=None, fiducial_size_cm=DEFAULT_FIDUCIAL_SIZE_CM):
         self.lan_ip = get_lan_ip(lan_ip)
+        _log(f"LAN IP for the QR code: {self.lan_ip} (adapter: {LAN_ADAPTER or '?'}; override with --lan-ip)")
         self.https_port = int(https_port)
         self.token = token or secrets.token_urlsafe(9)
         self.https_enabled = False
@@ -759,6 +806,16 @@ def build_mobile_router(hub, admin_local_only=True):
         text = f"PADELIQ-SCALE:{float(size_cm):g}cm"
         return Response(qr_png_bytes(text, size=int(np.clip(px, 200, 2400)), border=4), media_type="image/png",
                         headers={"Cache-Control": "no-store"})
+
+    @router.get("/api/mobile/pair")
+    def mobile_pair(request: Request):
+        """Pairing token for a phone that opened /mobile-camera without ?k= (typed URL / bookmark).
+        Only served to loopback or private-LAN (RFC 1918) clients - never to public addresses."""
+        host = getattr(getattr(request, "client", None), "host", "") or ""
+        if not (_is_loopback(request) or _is_private_v4(host)):
+            return JSONResponse({"ok": False, "error": "pairing is only available on the local network"},
+                                status_code=403)
+        return {"ok": True, "token": hub.token}
 
     @router.get("/api/mobile/status")
     def mobile_status(request: Request):

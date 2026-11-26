@@ -125,7 +125,7 @@ select{background:var(--bg2);border:1px solid var(--line-hi);border-radius:8px;p
 .barlbl b{color:var(--ink);font-family:var(--mono);font-weight:600}
 
 /* ---------- mobile QR portal ---------- */
-.btn.qr{display:flex;align-items:center;justify-content:center;gap:8px;width:100%;margin-bottom:10px;padding:10px 12px;font-size:13.5px;
+.btn.qr{display:inline-flex;align-items:center;justify-content:center;gap:8px;font-weight:700;
   background:linear-gradient(180deg,rgba(91,140,255,.28),rgba(62,224,196,.20));border-color:rgba(91,140,255,.55)}
 .btn.qr .live{width:8px;height:8px;border-radius:50%;background:var(--dim)}
 .btn.qr.on .live{background:var(--ok);box-shadow:0 0 8px var(--ok)}
@@ -185,6 +185,8 @@ select{background:var(--bg2);border:1px solid var(--line-hi);border-radius:8px;p
   <span class="clock">Session <b id="session" class="num">00:00</b> &middot; <span id="clock" class="num"></span></span>
   <button class="btn" id="btn-json" title="Download JSON report">Export JSON</button>
   <button class="btn" id="btn-csv" title="Download CSV report">CSV</button>
+  <button class="btn qr" id="btn-qr" type="button" title="Pair a phone as the court camera: scan the QR code [M]">
+    <span class="live" aria-hidden="true"></span><span id="qr-lbl">&#x1F4F1; Mobile QR Portal</span></button>
   <button class="btn primary" id="btn-html" title="Open printable executive summary">Official Report</button>
 </header>
 
@@ -259,8 +261,6 @@ select{background:var(--bg2);border:1px solid var(--line-hi);border-radius:8px;p
   <section class="card c-src" aria-label="Source switcher">
     <div class="hd"><h3>Source</h3><span id="src-state" style="font-size:12px;color:var(--mute)"></span></div>
     <div class="bd">
-      <button class="btn qr" id="btn-qr" type="button" title="Pair a phone as the court camera: scan the QR code [M]">
-        <span class="live" aria-hidden="true"></span><span id="qr-lbl">&#x1F4F1; Mobile QR Portal</span></button>
       <div class="seg" role="group" aria-label="Source type" id="src-seg">
         <button data-src="sim" aria-pressed="true">Match Replay</button>
         <button data-src="webcam" aria-pressed="false">Webcam</button>
