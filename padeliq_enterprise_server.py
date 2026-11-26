@@ -57,6 +57,7 @@ import cv2
 import padeliq_live_stream as E
 import court_geometry_ai as CG
 import padeliq_mobile_bridge as MB
+import padeliq_orientation as ORI
 
 try:
     import psutil
@@ -153,6 +154,11 @@ class PadelIQEngine:
                                    fiducial_size_cm=args.fiducial_size_cm)
         self.mobile.controller = EngineMobileController(self)
         self._waiting = (None, 0.0, "")         # cached QR waiting screen (img, built_at, detail)
+        self.rotation = 0                       # 0/90/180/270 applied to every camera frame before anything else
+        self.pending_autolock = False           # confirm + lock the court as soon as auto-calibration lands
+        self._oriented_cam = None
+        self._reorient_at = 0.0
+        self._last_raw = None
         self.clean_canvas = None
         self.clean_lock = threading.Lock()
 
@@ -183,7 +189,7 @@ class PadelIQEngine:
         self.last_det_ts = None
         self.ball_worker = E.BallWorker(lambda: self.cam, self.ball,
                                         lambda: (self.last_boxes, self.last_yolo_balls, self.last_kps, self.last_det_ts),
-                                        args.hud_min_height)
+                                        args.hud_min_height, rotation_getter=lambda: self.rotation)
 
         self.coach_feed = deque(maxlen=200)
         self._last_tip = {}
@@ -237,11 +243,13 @@ class PadelIQEngine:
             self._stash[self._src_key(self.spec)] = {
                 "corners": self.corners.copy(), "info": dict(self.review.info), "shape": self.canvas_shape,
                 "locked": self.calib_locked, "floor_mask": self.slot_mgr.floor_mask,
-                "floor_top_y": self.slot_mgr.floor_top_y, "calibration_info": dict(self.calibration_info)}
+                "floor_top_y": self.slot_mgr.floor_top_y, "calibration_info": dict(self.calibration_info),
+                "rotation": self.rotation}
 
     def _restore_calibration(self, spec):
         """Lock held: restore the target source's calibration, or start a fresh one."""
         self.ball.reset()
+        self.pending_autolock = False
         st = self._stash.get(self._src_key(spec))
         if st:
             self.canvas_shape = st["shape"]
@@ -254,7 +262,9 @@ class PadelIQEngine:
             self.ball.set_geometry(self.H, self.canvas_shape)
             self.calibration_info = st["calibration_info"]
             self.calib_locked = st["locked"]
+            self.rotation = st.get("rotation", 0)
         else:
+            self.rotation = 0
             self.canvas_shape = None          # new source -> provisional geometry + fresh auto-calibration
             self.corners = self.H = None
             self.review.reset()
@@ -375,6 +385,63 @@ class PadelIQEngine:
         self.toast("Calibration Locked" if locked else "Calibration Unlocked")
         return locked
 
+    # ----------------------------------------------------------- orientation
+    def set_rotation(self, deg, auto_lock=False, why=""):
+        """Lock held. New rotation -> fresh geometry + court re-calibration on the next (rotated) frame."""
+        self.rotation = ORI.norm_deg(deg)
+        self.epoch += 1
+        self.corners = self.H = None
+        self.canvas_shape = None                 # _ensure_geometry() restarts auto-calibration on the next frame
+        self.calibration_info = {}
+        self.review.reset()
+        self.slot_mgr.set_homography(None)
+        self.slot_mgr.reset_players()
+        self.ball.reset()
+        self.scene_cut.reset()
+        self.calib_frames.clear()
+        self.last_boxes, self.last_yolo_balls, self.last_kps = (np.zeros((0, 4), np.float32),
+                                                                np.zeros((0, 4), np.float32), [])
+        self.pending_autolock = bool(auto_lock)
+        self._roi_key = None
+        self._update_roi()
+        self.toast(f"Camera rotation {self.rotation} deg{(' - ' + why) if why else ''} - re-calibrating court", 2.5)
+
+    def auto_orient(self, raw, auto_lock=False, first=False):
+        """Lock held. Score the current rotation; below 55 % test 90 CW / 90 CCW / 180 and take the most upright."""
+        deg, score, scores = ORI.detect_orientation(raw, None if first else self.rotation)
+        log(f"Orientation check {raw.shape[1]}x{raw.shape[0]}: " +
+            ", ".join(f"{d} deg {v:.0f}%" for d, v in scores.items()) + f" -> {deg} deg")
+        self.set_rotation(deg, auto_lock=auto_lock, why=f"auto-orientation {score:.0f}%")
+        return deg
+
+    def rotate(self, step=90):
+        """Always allowed (rotation invalidates the geometry): releases the stage lock, re-locks after."""
+        raw = self._last_raw
+        new = ORI.norm_deg(self.rotation + int(step))
+        upright = raw is None or ORI.orientation_score(ORI.landscape(raw, new))[0] >= ORI.MIN_CONF
+        with self.lock:
+            self.calib_locked = False
+            self.set_rotation(new, auto_lock=bool(self.spec and self.spec.kind == "mobile") and upright,
+                              why="operator")
+            if not upright:                  # never auto-lock a court that looks sideways / upside down
+                self.toast(f"Rotated to {new} deg - court does not look upright: Rotate again or Auto-calibrate", 3.5)
+        return self.rotation
+
+    def _autolock_tick(self):
+        """Lock held: instant court lock after an orientation check (no 3 s review wait)."""
+        rv = self.review
+        if not self.pending_autolock:
+            return
+        if rv.state == "review" and rv.corners is not None and self.corners is not None:
+            self.pending_autolock = False
+            if rv.confirm("auto (orientation lock)"):
+                self._save_confirmed()
+                self.calib_locked = True
+                self.toast(f"Court locked at {self.rotation} deg ({rv.info.get('confidence_pct')}%) - analytics live", 3.0)
+        elif rv.state == "failed":
+            self.pending_autolock = False
+            self.toast("Court not found - press Rotate or drag the corners", 3.5)
+
     def _check_unlocked(self):
         if self.calib_locked:
             raise ValueError("calibration is locked - unlock it first")
@@ -426,14 +493,15 @@ class PadelIQEngine:
                 raw, fid, _ = cam.read_latest()
                 if raw is not None and fid != last_id:
                     last_id = fid
-                    collected.append(E.prepare_canvas(raw, self.args.hud_min_height))
+                    collected.append(E.prepare_canvas(raw, self.args.hud_min_height, self.rotation))
                 else:
                     time.sleep(0.012)
             if len(collected) >= 5:
                 return collected
         spec = self.spec
         if spec is not None and spec.kind == "file":
-            return [E.prepare_canvas(f, self.args.hud_min_height) for f in E.collect_calibration_frames(spec, count=16)]
+            return [E.prepare_canvas(f, self.args.hud_min_height, self.rotation)
+                    for f in E.collect_calibration_frames(spec, count=16)]
         end = time.time() + 1.4
         while time.time() < end and len(self.calib_frames) < 15:
             time.sleep(0.04)
@@ -464,6 +532,7 @@ class PadelIQEngine:
                 self.ball.set_geometry(H, self.canvas_shape)
                 self.calibration_info = dict(rv.info)
             self.applied_version = rv.version
+        self._autolock_tick()
         self._update_roi()
 
     def _save_confirmed(self):
@@ -538,12 +607,17 @@ class PadelIQEngine:
         """(Re-)run AI court recognition; returns once the result is in review (or failed)."""
         if self.spec is None or self.canvas_shape is None:
             raise ValueError("no active source / frame yet")
-        with self.clean_lock:
-            seed = None if self.clean_canvas is None else self.clean_canvas.copy()
-        with self.lock:
-            self._start_review(seed_frame=seed)
+        raw = self._last_raw
+        if raw is not None:
+            with self.lock:
+                self.auto_orient(raw, auto_lock=bool(self.spec and self.spec.kind == "mobile"))
+        else:
+            with self.clean_lock:
+                seed = None if self.clean_canvas is None else self.clean_canvas.copy()
+            with self.lock:
+                self._start_review(seed_frame=seed)
         end = time.time() + wait_s
-        while time.time() < end and self.review.state == "detecting":
+        while time.time() < end and self.review.state in ("idle", "detecting"):
             time.sleep(0.1)
         if self.review.state == "failed":
             raise ValueError(f"auto-calibration failed: {self.review.error}")
@@ -569,9 +643,20 @@ class PadelIQEngine:
                 continue
             last_fid = fid
             try:
-                canvas = E.prepare_canvas(frame, self.args.hud_min_height)
+                if cam.kind == "mobile" and self._reorient_at and time.time() >= self._reorient_at:
+                    self._reorient_at = 0.0                     # phone rotated: explicit operator action -> re-lock
+                    with self.lock:
+                        self.calib_locked = False
+                        self.auto_orient(frame, auto_lock=True, first=True)
+                elif cam.kind == "mobile" and self._oriented_cam is not cam and self.review.state != "confirmed":
+                    self._oriented_cam = cam                    # first phone frame: orientation check + instant lock
+                    with self.lock:
+                        self.auto_orient(frame, auto_lock=True, first=True)
+                rot = self.rotation
+                canvas = E.prepare_canvas(frame, self.args.hud_min_height, rot)
+                self._last_raw = frame
                 with self.lock:
-                    if cam is not self.cam:
+                    if cam is not self.cam or rot != self.rotation:
                         continue
                     self._ensure_geometry(canvas)
                     if self.review.state == "detecting":
@@ -634,7 +719,7 @@ class PadelIQEngine:
                             for _ in range(min(10, fid - last_fid)):
                                 self.capture_meter.tick()
                         last_fid, last_ts, new = fid, ts, True
-                        last_canvas = E.prepare_canvas(frame, self.args.hud_min_height)
+                        last_canvas = E.prepare_canvas(frame, self.args.hud_min_height, self.rotation)
                         with self.clean_lock:
                             self.clean_canvas = last_canvas
                 else:
@@ -813,7 +898,7 @@ class PadelIQEngine:
             "mobile": self.mobile.status(include_token=False),
             "camera": {"exposure": dict(cam.exposure_info) if cam is not None and cam.kind == "webcam"
                        else {"mode": self.exposure_pref, "label": E.EXPOSURE_LABELS[self.exposure_pref]},
-                       "is_webcam": bool(cam is not None and cam.kind == "webcam")},
+                       "is_webcam": bool(cam is not None and cam.kind == "webcam"), "rotation": self.rotation},
             "failover": {"on_alternate": self.failover_on_alt, "primary": E._redact_url(str(self.failover_primary)),
                          "alternate": self.args.failover_source or "sim / webcam"},
             "ai": self.detector.backend_info,
@@ -884,7 +969,7 @@ class EngineMobileController(MB.MobileController):
         e = self.e
         if not self._mobile_active():
             return {"state": "idle" if e.source_state != "switching" else "detecting", "corners": None,
-                    "frame_shape": None, "locked": e.calib_locked}
+                    "frame_shape": None, "locked": e.calib_locked, "rotation": e.rotation}
         rv, now = e.review, time.time()
         st = rv.status()
         with rv.lock:
@@ -894,7 +979,7 @@ class EngineMobileController(MB.MobileController):
             players = sum(1 for p in e.slot_mgr.players.values() if p.is_active(now))
             shape = e.canvas_shape
         return dict(st, corners=corners, frame_shape=shape, version=version, players=players,
-                    inference_fps=round(e.infer_meter.rate, 1), locked=e.calib_locked)
+                    inference_fps=round(e.infer_meter.rate, 1), locked=e.calib_locked, rotation=e.rotation)
 
     def auto_detect(self):
         if not self._mobile_active():
@@ -933,6 +1018,9 @@ class EngineMobileController(MB.MobileController):
             return
         log("Phone paired via QR -> switching the live source to the phone camera")
         e.set_source("mobile", background=True)   # never block the phone's WebSocket loop
+
+    def on_phone_rotated(self, meta):
+        self.e._reorient_at = time.time() + 0.4      # let frames in flight with the old rotation drain first
 
     def hud_jpeg(self):
         e = self.e
@@ -1214,6 +1302,19 @@ def create_app(engine):
             body = {}
         try:
             return {"ok": True, **engine.set_exposure(str(body.get("mode", "toggle")))}
+        except Exception as exc:
+            return err(str(exc))
+
+    @app.post("/api/camera/rotate")
+    async def camera_rotate(request: Request):
+        """{"step": 90} (default) rotates the live feed by 90 deg clockwise and re-calibrates the court."""
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        try:
+            deg = await asyncio.to_thread(engine.rotate, int((body or {}).get("step", 90)))
+            return {"ok": True, "rotation": deg}
         except Exception as exc:
             return err(str(exc))
 

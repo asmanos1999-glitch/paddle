@@ -50,6 +50,7 @@ import numpy as np
 from scipy.optimize import linear_sum_assignment
 
 import court_geometry_ai as CG
+import padeliq_orientation as ORI
 
 # Never crash on console encoding (Windows cp1252 consoles, redirected output).
 for _stream in (sys.stdout, sys.stderr):
@@ -2462,9 +2463,10 @@ class BallWorker:
     slower person detector, so fast balls keep a dense trajectory. boxes_getter() -> (boxes, yolo_balls[,
     keypoints[, detection_capture_ts]])."""
 
-    def __init__(self, cam_getter, ball, boxes_getter, min_height=720, max_fps=60.0):
+    def __init__(self, cam_getter, ball, boxes_getter, min_height=720, max_fps=60.0, rotation_getter=None):
         self.cam_getter, self.ball, self.boxes_getter = cam_getter, ball, boxes_getter
         self.min_height, self.period = min_height, 1.0 / max_fps
+        self.rotation_getter = rotation_getter or (lambda: 0)
         self.running = True
         self.rate = 0.0
         self.errors = 0
@@ -2486,7 +2488,7 @@ class BallWorker:
                 if frame is None or fid == last_fid:
                     continue
                 last_fid = fid
-                canvas = prepare_canvas(frame, self.min_height)
+                canvas = prepare_canvas(frame, self.min_height, self.rotation_getter())
                 got = self.boxes_getter()
                 boxes, yolo_balls = got[0], got[1]
                 kps = got[2] if len(got) > 2 else None
@@ -2995,7 +2997,7 @@ def draw_coach_panel(frame, slot_mgr, now, s, fps_val, source_label, recording, 
             r = max(4, int(7 * s))
             put_text(im, rec, (pw - rec_w + 2 * r + int(5 * s), y), 0.48 * s, (60, 60, 255), 2, s)
         y += lh + int(2 * s)
-        put_text(im, fit_text("[C] Calibrate  [L] Lock  [E] Shutter  [F] Full  [F12] Failover  [M] QR  [S] Rec  [Q] Quit",
+        put_text(im, fit_text("[C] Calib  [L] Lock  [R] Rotate  [E] Shutter  [F] Full  [F12] Failover  [M] QR  [S] Rec  [Q] Quit",
                               0.42 * s, 1, inner_w), (tx, y), 0.42 * s, (200, 200, 200), 1, s)
         y += lh + int(6 * s)
         put_text(im, "AI Coach Suggestions:", (tx, y), 0.52 * s, (255, 255, 255), 2, s)
@@ -3365,17 +3367,44 @@ class PersonDetector:
 # =====================================================================
 # 10. Main live loop
 # =====================================================================
-def prepare_canvas(raw, min_height):
-    """Upscale low-res streams (ESP32 640x480 / 800x600) so HUD text stays crisp."""
-    h, w = raw.shape[:2]
+def prepare_canvas(raw, min_height, rotation=0):
+    """Rotate (0/90/180/270) BEFORE any resize, never squash a portrait buffer (pillarboxed 16:9 instead), then
+    upscale low-res streams (ESP32 640x480 / 800x600) so HUD text stays crisp."""
     if raw.ndim == 2:
         raw = cv2.cvtColor(raw, cv2.COLOR_GRAY2BGR)
     elif raw.shape[2] == 4:
         raw = cv2.cvtColor(raw, cv2.COLOR_BGRA2BGR)
+    if rotation or raw.shape[0] > raw.shape[1]:
+        raw = ORI.landscape(raw, rotation)
+    h, w = raw.shape[:2]
     if min_height and h < min_height:
         f = min_height / float(h)
         return cv2.resize(raw, (int(round(w * f)), int(min_height)), interpolation=cv2.INTER_LINEAR)
     return raw
+
+
+def fit_to_window(img, win, cache):
+    """The Win32 HighGUI backend stretches imshow() images to the window (WINDOW_KEEPRATIO is ignored), so the HUD
+    is letterboxed to the window's aspect here: fonts and the minimap are never squashed, in any window size."""
+    now = time.time()
+    if now - cache.get("t", 0) > 0.25:
+        try:
+            cache["rect"] = cv2.getWindowImageRect(win)
+        except Exception:
+            cache["rect"] = None
+        cache["t"] = now
+    rect = cache.get("rect")
+    if not rect or rect[2] <= 0 or rect[3] <= 0:
+        return img
+    h, w = img.shape[:2]
+    ar_win, ar = rect[2] / float(rect[3]), w / float(h)
+    if abs(ar_win / ar - 1.0) < 0.01:
+        return img
+    if ar_win > ar:
+        pad = int(round(h * ar_win)) - w
+        return cv2.copyMakeBorder(img, 0, 0, pad // 2, pad - pad // 2, cv2.BORDER_CONSTANT, value=(0, 0, 0))
+    pad = int(round(w / ar_win)) - h
+    return cv2.copyMakeBorder(img, pad // 2, pad - pad // 2, 0, 0, cv2.BORDER_CONSTANT, value=(0, 0, 0))
 
 
 def placeholder_frame(size=(1280, 720)):
@@ -3419,6 +3448,48 @@ class LiveSession:
         self._stash = {}                    # per-source confirmed calibration (F12 swaps)
         self.epoch = 0                      # bumps on source swaps: stale AI results are dropped
         self._toast = ("", 0.0)
+        self.rotation = 0                   # 0/90/180/270 applied to every camera frame before anything else
+        self.pending_autolock = False       # confirm + lock the court as soon as auto-calibration lands
+        self.last_raw = None                # newest un-rotated camera frame (orientation check)
+
+    # --------------------------------------------------------- orientation
+    def set_rotation(self, deg, auto_lock=False, why=""):
+        """Lock held. New rotation -> fresh geometry + court re-calibration on the next (rotated) frame."""
+        self.rotation = ORI.norm_deg(deg)
+        self.epoch += 1
+        self.corners = self.H = None
+        self.canvas_shape = None            # ensure_geometry() restarts auto-calibration on the next frame
+        self.review.reset()
+        self.slot_mgr.set_homography(None)
+        self.slot_mgr.reset_players()
+        self.ball.reset()
+        self.scene_cut.reset()
+        self.calib_frames.clear()
+        self.last_boxes, self.last_yolo_balls, self.last_kps = np.zeros((0, 4), np.float32), np.zeros((0, 4), np.float32), []
+        self.pending_autolock = bool(auto_lock)
+        self.toast(f"Camera rotation {self.rotation} deg{(' - ' + why) if why else ''} - re-calibrating court", 2.5)
+
+    def auto_orient(self, raw, auto_lock=False, first=False):
+        """Lock held. Score the current rotation; below 55 % test 90 CW / 90 CCW / 180 and take the most upright."""
+        deg, score, scores = ORI.detect_orientation(raw, None if first else self.rotation)
+        log(f"Orientation check {raw.shape[1]}x{raw.shape[0]}: " +
+            ", ".join(f"{d} deg {v:.0f}%" for d, v in scores.items()) + f" -> {deg} deg")
+        self.set_rotation(deg, auto_lock=auto_lock, why=f"auto-orientation {score:.0f}%")
+        return deg
+
+    def _autolock_tick(self):
+        rv = self.review
+        if not self.pending_autolock:
+            return
+        if rv.state == "review" and rv.corners is not None and self.corners is not None:
+            self.pending_autolock = False
+            if rv.confirm("auto (orientation lock)") and self.canvas_shape is not None:
+                self.save_confirmed(self.canvas_shape)
+                self.calib_locked = True
+                self.toast(f"Court locked at {self.rotation} deg ({rv.info.get('confidence_pct')}%) - analytics live", 3.0)
+        elif rv.state == "failed":
+            self.pending_autolock = False
+            self.toast("Court not found - press [R] to rotate or [C] to drag corners", 3.5)
 
     # --------------------------------------------------------- stage helpers
     def toast(self, msg, secs=2.2):
@@ -3467,8 +3538,9 @@ class LiveSession:
             self._stash[self._src_key(self.spec)] = {
                 "corners": self.corners.copy(), "info": dict(self.review.info), "shape": self.canvas_shape,
                 "locked": self.calib_locked, "floor_mask": self.slot_mgr.floor_mask,
-                "floor_top_y": self.slot_mgr.floor_top_y}
+                "floor_top_y": self.slot_mgr.floor_top_y, "rotation": self.rotation}
         self.spec = new_spec
+        self.pending_autolock = False
         self.save_path, self.load_paths = calibration_files_for(new_spec.kind)
         self.epoch += 1
         self.slot_mgr.reset_players()
@@ -3487,11 +3559,13 @@ class LiveSession:
             self.slot_mgr.floor_mask, self.slot_mgr.floor_top_y = st["floor_mask"], st["floor_top_y"]
             self.ball.set_geometry(self.H, self.canvas_shape)
             self.calib_locked = st["locked"]
+            self.rotation = st.get("rotation", 0)
         else:
             self.canvas_shape = None
             self.corners = self.H = None
             self.review.reset()
             self.calib_locked = False
+            self.rotation = 0
         self._roi_key = None
         self._update_roi()
 
@@ -3507,13 +3581,14 @@ class LiveSession:
                 raw, fid, _ = cam.read_latest()
                 if raw is not None and fid != last_id:
                     last_id = fid
-                    collected.append(prepare_canvas(raw, self.args.hud_min_height))
+                    collected.append(prepare_canvas(raw, self.args.hud_min_height, self.rotation))
                 else:
                     time.sleep(0.012)
             if len(collected) >= 5:
                 return collected
         if self.spec.kind == "file":
-            return [prepare_canvas(f, self.args.hud_min_height) for f in collect_calibration_frames(self.spec, count=16)]
+            return [prepare_canvas(f, self.args.hud_min_height, self.rotation)
+                    for f in collect_calibration_frames(self.spec, count=16)]
         end = time.time() + 1.4
         while time.time() < end and len(self.calib_frames) < 15:
             time.sleep(0.04)
@@ -3561,6 +3636,7 @@ class LiveSession:
                     self.slot_mgr.reset_players()
                 self.ball.set_geometry(H, (canvas_shape[0], canvas_shape[1]))
             self.applied_version = rv.version
+        self._autolock_tick()
         self._update_roi()
 
     def save_confirmed(self, canvas_shape):
@@ -3639,7 +3715,18 @@ class LiveSession:
             return
         if ch == "a":
             log("Re-scanning court geometry ...")
-            self.start_auto_calibration(seed_frame=clean_canvas)
+            if self.last_raw is not None:
+                self.auto_orient(self.last_raw, auto_lock=self.spec.kind == "mobile")
+            else:
+                self.start_auto_calibration(seed_frame=clean_canvas)
+            return
+        if ch == "r":                       # always allowed: rotating invalidates the geometry -> re-lock after
+            self.calib_locked = False
+            new = ORI.norm_deg(self.rotation + 90)
+            upright = self.last_raw is None or                 ORI.orientation_score(ORI.landscape(self.last_raw, new))[0] >= ORI.MIN_CONF
+            self.set_rotation(new, auto_lock=self.spec.kind == "mobile" and upright, why="[R]")
+            if not upright:                  # never auto-lock a court that looks sideways / upside down
+                self.toast(f"Rotated to {new} deg - court does not look upright: press [R] again or [A] to auto-orient", 3.5)
             return
         if rv.state == "manual" and ch == "n":
             rv.toggle_click_mode()
@@ -3649,7 +3736,7 @@ class LiveSession:
             return
         if key == 27 or ch == "q":
             self.quit = True
-        elif ch == "r":
+        elif ch == "x":
             self.slot_mgr.reset_players()
             log("All player stats reset.")
         elif ch == "s":
@@ -3740,6 +3827,7 @@ class SessionMobileController:
         self.s = session
         self.last_canvas = None
         self.phone_ready = False            # set on the first phone frame -> the display loop swaps sources
+        self.reorient_at = 0.0              # phone rotated -> display loop re-runs the orientation check
 
     def _active(self):
         return self.s.spec is not None and self.s.spec.kind == "mobile"
@@ -3751,7 +3839,8 @@ class SessionMobileController:
     def calibration_snapshot(self):
         s, now = self.s, time.time()
         if not self._active():
-            return {"state": "idle", "corners": None, "frame_shape": None, "locked": s.calib_locked}
+            return {"state": "idle", "corners": None, "frame_shape": None, "locked": s.calib_locked,
+                    "rotation": s.rotation}
         rv = s.review
         st = rv.status()
         with rv.lock:
@@ -3761,7 +3850,7 @@ class SessionMobileController:
             players = sum(1 for p in list(s.slot_mgr.players.values()) if p.is_active(now))
             shape = s.canvas_shape
         return dict(st, corners=corners, frame_shape=shape, version=version, players=players,
-                    inference_fps=round(s.fps, 1), locked=s.calib_locked)
+                    inference_fps=round(s.fps, 1), locked=s.calib_locked, rotation=s.rotation)
 
     def auto_detect(self):
         self._unlocked()
@@ -3808,6 +3897,9 @@ class SessionMobileController:
 
     def on_phone_connected(self, meta):
         self.phone_ready = True
+
+    def on_phone_rotated(self, meta):
+        self.reorient_at = time.time() + 0.4    # let frames in flight with the old rotation drain first
 
     def hud_jpeg(self):
         return None
@@ -3906,20 +3998,23 @@ def run_live_padeliq(args):
     e2e_ms = deque(maxlen=600)          # capture/arrival -> frame shown (per displayed camera frame)
     ball_worker = BallWorker(lambda: cam, session.ball,
                              lambda: (session.last_boxes, session.last_yolo_balls, session.last_kps, session.last_det_ts),
-                             args.hud_min_height)
+                             args.hud_min_height, rotation_getter=lambda: session.rotation)
+    oriented_cam = None                 # phone cameras get an orientation check + instant lock on their first frame
+    win_cache = {}
     win_name = "PadelIQ Live Camera Engine"
     if display:
-        cv2.namedWindow(win_name, cv2.WINDOW_NORMAL | cv2.WINDOW_KEEPRATIO)
+        cv2.namedWindow(win_name, cv2.WINDOW_NORMAL)
+        cv2.resizeWindow(win_name, 1280, 720)
         cv2.setMouseCallback(win_name, lambda ev, x, y, fl, pa: session.review.on_mouse(ev, x, y))
         log("Live engine running:  [Enter] confirm court  [C] drag corners  [A] re-scan  [L] lock calibration  "
             "[E] auto exposure / sport shutter  [K] camera driver settings  [F] fullscreen  [F12] failover  "
-            "[M] mobile QR portal  [R] reset  [S] record  [Q] quit")
+            "[M] mobile QR portal  [R] rotate 90  [X] reset stats  [S] record  [Q] quit")
 
     # Scripted key presses exercise the same handlers headlessly during --test-run.
     scripted_keys = {}
     if test_mode:
         n = args.test_run
-        scripted_keys = {max(2, n // 10): ord('s'), max(3, n // 4): ord('r'), max(4, (n * 3) // 5): ord('s')}
+        scripted_keys = {max(2, n // 10): ord('s'), max(3, n // 4): ord('x'), max(4, (n * 3) // 5): ord('s')}
         if args.test_stage_keys:
             scripted_keys.update({max(5, (n * 7) // 10): ord('l'), max(6, (n * 3) // 4): ord('a'),
                                   max(7, (n * 4) // 5): ord('e')})
@@ -3928,6 +4023,9 @@ def run_live_padeliq(args):
             scripted_keys[max(9, (n * 2) // 3)] = F12_KEYS[0]
         if args.test_qr:
             scripted_keys[max(5, n // 5)] = ord('m')
+        if args.test_rotate:                   # unlock, rotate 90 (pillarboxed, un-stretched), auto-orient back
+            scripted_keys[max(10, (n * 2) // 5)] = ord('r')
+            scripted_keys[max(11, n // 2)] = ord('a')
 
     processed = 0                       # frames processed by the AI worker
     displayed = 0                       # camera frames shown in the window
@@ -3942,6 +4040,7 @@ def run_live_padeliq(args):
     recordings_made = []
     captured = False
     captured_ball = False
+    rot_shot_due = None
 
     try:
         while not session.quit:
@@ -3985,8 +4084,22 @@ def run_live_padeliq(args):
             processed = ai.inferred
             if new_frame:
                 last_fid, last_cap_ts = fid, cap_ts
-                canvas = prepare_canvas(raw, args.hud_min_height)
+                mc = mobile["ctrl"]
+                if mc is not None and mc.reorient_at and time.time() >= mc.reorient_at and cam.kind == "mobile":
+                    mc.reorient_at = 0.0                   # phone rotated: explicit operator action -> re-lock
+                    with session.lock:
+                        session.calib_locked = False
+                        session.auto_orient(raw, auto_lock=True, first=True)
+                elif cam.kind == "mobile" and oriented_cam is not cam and session.review.state != "confirmed":
+                    oriented_cam = cam
+                    with session.lock:
+                        session.auto_orient(raw, auto_lock=True, first=True)
+                rot = session.rotation
+                canvas = prepare_canvas(raw, args.hud_min_height, rot)
                 with session.lock:
+                    session.last_raw = raw
+                    if rot != session.rotation:            # rotated meanwhile: drop this stale-orientation frame
+                        continue
                     session.ensure_geometry(canvas)
                     session.note_frame(canvas)
                     session.sync_review(canvas.shape)
@@ -4065,11 +4178,16 @@ def run_live_padeliq(args):
                 captured_ball = True
                 log(f"[verify] saved {os.path.basename(args.capture_ball)}: ball {session.ball.speed_kmh:.0f} km/h, "
                     f"trail {len(session.ball.trail)} pts, shots {session.ball.shots}, court {session.ball.court_pos}")
+            if rot_shot_due is not None and processed >= rot_shot_due:
+                rot_shot_due = None
+                cv2.imwrite(os.path.join(APP_DIR, "rotate_test_verified.jpg"), hud)
+                log(f"[test] [R] frame: rotation {session.rotation} deg, HUD {hud.shape[1]}x{hud.shape[0]} "
+                    f"-> rotate_test_verified.jpg")
             if new_frame:
                 e2e_ms.append((time.time() - last_cap_ts) * 1000.0)
             key = -1
             if display:
-                cv2.imshow(win_name, hud)
+                cv2.imshow(win_name, fit_to_window(hud, win_name, win_cache))
                 key = cv2.waitKeyEx(1)
                 if shown and cv2.getWindowProperty(win_name, cv2.WND_PROP_VISIBLE) < 1:
                     log("Window closed.")
@@ -4079,6 +4197,8 @@ def run_live_padeliq(args):
                 due = [k for k in scripted_keys if k <= processed and k > prev_processed] if processed != prev_processed else []
                 if due:
                     key = scripted_keys.pop(due[0])
+                    if key == ord('r'):
+                        rot_shot_due = processed + 25
                     log(f"[test] simulating key '{'F12' if key in F12_KEYS else chr(key).upper()}' at frame {processed}")
 
             was_recording = session.recorder.active
@@ -4128,9 +4248,18 @@ def run_live_padeliq(args):
                         f"{ai.latency_ms:.0f} ms/inference) | window showed {displayed} camera frames "
                         f"(~{session.fps:.1f} display FPS) | capture->display latency median {np.median(lat):.1f} ms, "
                         f"p95 {np.percentile(lat, 95):.1f} ms -> screenshot {os.path.basename(VERIFY_SCREENSHOT)}")
+                    if args.test_rotate:
+                        up = ORI.orientation_score(ORI.landscape(session.last_raw, session.rotation))[0]                             if session.last_raw is not None else 0.0
+                        log(f"[test] final orientation score {up:.0f}% at {session.rotation} deg")
+                        if up < ORI.MIN_CONF or not session.calib_locked:
+                            log("[test] FAILED: [A] did not restore an upright, locked court after [R]")
+                            exit_code = 1
                     if args.test_qr and spec.kind != "mobile":
                         log("[test] FAILED: [M] QR portal did not switch to the phone camera")
                         exit_code = 1
+                    log(f"[test] orientation: rotation {session.rotation} deg | canvas "
+                        f"{last_canvas.shape[1] if last_canvas is not None else 0}x"
+                        f"{last_canvas.shape[0] if last_canvas is not None else 0}")
                     log(f"[test] stage: calibration locked={session.calib_locked} | F12 swaps={swaps_done} | "
                         f"longest gap between displayed frames {max_gap_ms:.0f} ms | AI {detector.backend_info}")
                     if big_gaps:
@@ -4237,6 +4366,7 @@ def build_arg_parser():
     p.add_argument("--test-stage-keys", action="store_true", help="--test-run also presses [L], [A] (refused), [E]")
     p.add_argument("--test-failover", action="store_true", help="--test-run also presses [F12] twice")
     p.add_argument("--test-qr", action="store_true", help="--test-run also presses [M]; a phone must then stream")
+    p.add_argument("--test-rotate", action="store_true", help="--test-run also presses [R] (rotate 90) then [A] (auto-orient)")
     p.add_argument("--capture-verified", default="", metavar="PATH",
                    help="save the first frame with confirmed calibration, 4 players on correct sides and the ball visible")
     p.add_argument("--auto-calibrate", action="store_true",

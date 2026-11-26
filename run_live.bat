@@ -39,8 +39,8 @@ echo   [8] Run headless smoke test        (--test-run 100)
 echo   [9] Auto-calibrate the demo court  (from court lines)
 echo   [Q] Quit
 echo ----------------------------------------------------------
-echo   Desktop keys: [C] calibrate [L] lock [E] shutter [F] fullscreen
-echo                 [F12] failover [M] QR portal [S] record [Q] quit
+echo   Desktop keys: [C] calibrate [L] lock [R] rotate 90 [E] shutter [F] fullscreen
+echo                 [F12] failover [M] QR portal [S] record [X] reset [Q] quit
 echo ==========================================================
 set "CHOICE="
 set /p "CHOICE=Select an option: "

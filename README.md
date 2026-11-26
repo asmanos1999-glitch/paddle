@@ -69,6 +69,26 @@ token; the page then fetches it from `/api/mobile/pair`, which only answers priv
 
 If Windows Firewall asks, allow Python on private networks so the phone can reach port 8443.
 
+### Orientation (sideways / portrait-locked phones)
+
+Frames are never stretched.
+
+- **On the phone.** A portrait camera buffer, which is what a portrait-locked phone gives when held sideways,
+  is rotated in the canvas before JPEG encoding, so the stage receives a true 1280x720 landscape frame.
+  **🔄 Rotate 90°** cycles the transmitted image through 0° → 90° → 180° → 270°. The choice is remembered on
+  that phone.
+- **In both engines.** Every camera frame is rotated (`0/90/180/270`) before any resize or HUD drawing. A
+  frame that would still be portrait is uniformly scaled and pillarboxed onto 16:9, never squashed.
+- **Automatic orientation.** On the first phone frame, and on `[A]`, a dedicated orientation score (court
+  floor low and widening toward the camera, plus horizontal net/court lines; ~7 ms) checks the current
+  rotation. Below 55 %, it tests 90° CW, 90° CCW and 180° and keeps the most upright one. The court is then
+  confirmed and locked as soon as auto-calibration lands, without the 3 s review. The court AI's own
+  confidence cannot be used for this, because a sideways court still scores ~87 %.
+- **`[R]`.** Rotates by 90° and re-calibrates. It only auto-locks when the new orientation scores as
+  upright, so a wrong manual rotation is never locked.
+- **Desktop window.** The window is letterboxed to its own aspect ratio, so HUD fonts and the minimap stay
+  undistorted at any window size or in fullscreen.
+
 ## Stage pipeline
 
 - **OpenVINO FP16 inference.** Detection (`yolov8n_openvino_model`, static 288x480) and pose
@@ -127,15 +147,16 @@ E2E = camera frame captured (or phone JPEG received) → annotated JPEG ready.
 |-------|-----------------------------------------------|----------------------------------|
 | `C`   | Calibrate: drag court corners                 | Drag court corners               |
 | `Enter` | Confirm the detected court                  | Confirm                          |
-| `A`   | Re-scan the court                             | –                                |
+| `A`   | Orientation check + re-scan the court         | Auto-calibrate                   |
 | `L`   | Lock / unlock the calibration (geometry keys and scene-cut re-calibration disabled) | Lock button |
 | `E`   | Auto exposure ↔ Fast Sport Shutter (USB webcams) | Shutter button                |
 | `K`   | Camera driver settings (Power Line Frequency) | Camera settings button          |
 | `F`   | Borderless fullscreen                         | (browser F11)                    |
 | `F12` | Failover: live camera ↔ clean replay, swapped only once the target has frames | Failover button |
 | `M`   | Mobile QR portal overlay                      | Mobile QR Portal modal           |
+| `R`   | Rotate the camera feed 90° clockwise + re-calibrate (always allowed; releases and re-takes the lock) | 🔄 Rotate [R] button |
 | `S`   | Start / stop MP4 recording                    | –                                |
-| `R`   | Reset player stats                            | –                                |
+| `X`   | Reset player stats                            | –                                |
 | `Q`   | Quit                                          | –                                |
 
 If a camera stalls for more than 1 s, the last frame is held with a small *Re-locking Camera…* badge

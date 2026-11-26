@@ -235,6 +235,7 @@ select{background:var(--bg2);border:1px solid var(--line-hi);border-radius:8px;p
       <button class="btn" id="btn-lock" aria-pressed="false" title="Lock the confirmed court calibration so stray clicks / keys cannot change it">&#x1F513; Lock calibration [L]</button>
       <button class="btn" id="btn-exp" aria-pressed="false" title="Toggle webcam Auto Exposure / Fast Sport Shutter (max FPS) without restarting the camera">Auto Exposure [E]</button>
       <button class="btn" id="btn-failover" title="Hot-swap Live camera &harr; clean match replay; the current view stays live until the other source is ready">&#x21C4; Failover [F12]</button>
+      <button class="btn" id="btn-rotate" title="Rotate the live camera feed 90 deg clockwise and re-calibrate the court [R]">&#x1F504; Rotate [R]</button>
       <button class="btn" id="btn-camset" title="Open the webcam driver settings on the server machine (Power Line Frequency 50 Hz)">Camera settings</button>
     </div>
   </section>
@@ -607,6 +608,9 @@ async function stageFailover(){ try{ const j = await api("/api/failover", {});
 $("#btn-lock").addEventListener("click", stageLock);
 $("#btn-exp").addEventListener("click", stageExposure);
 $("#btn-failover").addEventListener("click", stageFailover);
+async function stageRotate(){
+  try{ const j = await api("/api/camera/rotate", {step: 90}); toast(`Camera rotated to ${j.rotation}\u00B0 - re-calibrating court`); }catch(e){} }
+$("#btn-rotate").addEventListener("click", stageRotate);
 $("#btn-camset").addEventListener("click", async () => { try{ const j = await api("/api/camera/settings", {}); toast(j.note); }catch(e){} });
 
 /* ---------- toolbar ---------- */
@@ -744,6 +748,7 @@ document.addEventListener("keydown", ev => {
     const kk = ev.key.toLowerCase();
     if(kk === "l"){ stageLock(); return; }
     if(kk === "m"){ qrModal.open ? closeQr() : openQr(); return; }
+    if(kk === "r"){ stageRotate(); return; }
     if(kk === "e" && stageState.webcam){ stageExposure(); return; }
     if(stageState.locked && ["c","n","a"].includes(kk)){ toast("Calibration is locked - press L to unlock", true); return; }
   }

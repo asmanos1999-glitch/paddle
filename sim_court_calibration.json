@@ -5,50 +5,47 @@
   ],
   "corners": [
     [
-      386.65655517578125,
-      358.2822570800781
+      0.0,
+      544.0
     ],
     [
-      913.3973388671875,
-      360.5602111816406
+      1279.0,
+      568.0
     ],
     [
-      3488.890625,
-      1310.41650390625
+      1279.0,
+      719.0
     ],
     [
-      -2497.639404296875,
-      1378.2689208984375
+      0.0,
+      719.0
     ]
   ],
   "lab_median": [
-    132.0,
+    138.0,
     135.0,
     80.0
   ],
-  "court_hue": 108,
-  "court_sat": 174.0,
-  "floor_top_y": 360,
-  "floor_area_pct": 38.1,
-  "surface_agreement_pct": 71.4,
-  "surface_recall_pct": 100.0,
-  "line_support_pct": 93.3,
-  "ankle_containment_pct": 100.0,
-  "confidence_pct": 92.1,
-  "solver_mode": "low_baseline",
-  "method": "court_geometry_ai_low_baseline",
+  "court_hue": 107,
+  "court_sat": 171.0,
+  "floor_top_y": 529,
+  "floor_area_pct": 37.3,
+  "surface_agreement_pct": 100.0,
+  "surface_recall_pct": 63.0,
+  "line_support_pct": 5.0,
+  "ankle_containment_pct": 31.5,
+  "confidence_pct": 78.1,
+  "solver_mode": "floor_hull",
+  "method": "court_geometry_ai_floor_hull",
   "engine": "CourtGeometryAI (Surface + 2-VP RANSAC + Pose-Ankle Hull)",
   "angle": "Baseline",
   "frames_used": 15,
   "ankle_seeds": 18,
-  "solve_ms": 1769.8,
-  "vp_long": [
-    646.8,
-    258.1
-  ],
+  "solve_ms": 1397.2,
+  "vp_long": null,
   "vp_trans": null,
-  "detection_s": 3.61,
+  "detection_s": 2.7,
   "confirmed_by": "auto (no input for 3 s)",
-  "confirmed_at": "2026-11-26T18:59:11",
+  "confirmed_at": "2026-11-26T19:32:03",
   "source_label": "SIM LOOP: clean_padel_match.mp4"
 }

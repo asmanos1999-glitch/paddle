@@ -49,6 +49,8 @@ from collections import deque
 import numpy as np
 import cv2
 
+import padeliq_orientation as ORI
+
 MOBILE_HTTPS_PORT = 8443
 DEFAULT_FIDUCIAL_SIZE_CM = 20.0
 COURT_W_M, COURT_L_M = 10.0, 20.0
@@ -370,6 +372,9 @@ class MobileController:
         raise NotImplementedError
 
     def on_phone_connected(self, meta):      # e.g. auto-switch the engine to the mobile source (must not block)
+        pass
+
+    def on_phone_rotated(self, meta):        # phone-side rotation changed -> re-run the orientation check
         pass
 
     def hud_jpeg(self):                      # optional: latest annotated JPEG for the phone's HUD view
@@ -865,8 +870,11 @@ def build_mobile_router(hub, admin_local_only=True):
             corners = snap.get("corners")
             norm = None
             if corners is not None and fs:
-                c = np.asarray(corners, np.float64).reshape(4, 2)
-                norm = np.round(c / np.array([fs[1], fs[0]], np.float64), 5).tolist()
+                c = np.asarray(corners, np.float64).reshape(4, 2) / np.array([fs[1], fs[0]], np.float64)
+                raw = hub.last_frame_shape
+                if raw:
+                    c = ORI.canvas_to_raw(c, (raw[1], raw[0]), snap.get("rotation", 0))
+                norm = np.round(c, 5).tolist()
             out = {"type": "calib", "state": snap.get("state"), "corners": norm,
                    "version": snap.get("version"), "confidence_pct": snap.get("confidence_pct"),
                    "method": snap.get("method"), "angle": snap.get("angle"), "banner": snap.get("banner"),
@@ -874,7 +882,8 @@ def build_mobile_router(hub, admin_local_only=True):
                    "players": snap.get("players"), "inference_fps": snap.get("inference_fps"),
                    "stream_fps": round(hub.cam.native_fps, 1) if hub.cam is not None else 0.0,
                    "source_active": hub.cam is not None, "fiducial": hub.fiducial.public_state(),
-                   "hud": hub.controller.hud_jpeg() is not None, "locked": bool(snap.get("locked"))}
+                   "hud": hub.controller.hud_jpeg() is not None, "locked": bool(snap.get("locked")),
+                   "rotation": snap.get("rotation", 0)}
             return out
 
         async def pusher():
@@ -896,12 +905,16 @@ def build_mobile_router(hub, admin_local_only=True):
                     pass
 
         def to_px(pts):
-            fs = (hub.controller.calibration_snapshot() or {}).get("frame_shape") or hub.last_frame_shape
+            snap = hub.controller.calibration_snapshot() or {}
+            fs = snap.get("frame_shape") or hub.last_frame_shape
             if not fs:
                 raise ValueError("no video frame yet")
             a = np.asarray(pts, np.float64).reshape(4, 2)
             if not np.all(np.isfinite(a)):
                 raise ValueError("invalid corners")
+            raw = hub.last_frame_shape
+            if raw:                                     # phone frame -> analysed (rotated) canvas
+                a = ORI.raw_to_canvas(a, (raw[1], raw[0]), snap.get("rotation", 0))
             return (a * np.array([fs[1], fs[0]], np.float64)).astype(np.float32)
 
         await send({"type": "welcome", "server": "PadelIQ", "lan_ip": hub.lan_ip, "ack_every": 1,
@@ -939,8 +952,12 @@ def build_mobile_router(hub, admin_local_only=True):
                     continue
                 typ = m.get("type")
                 if typ == "meta":
+                    old_rot = hub.meta.get("rot")
                     hub.meta = {k: m.get(k) for k in ("w", "h", "orientation", "lens", "zoom", "lenses", "ua",
-                                                      "facing", "fps", "track_w", "track_h") if k in m}
+                                                      "facing", "fps", "track_w", "track_h", "rot") if k in m}
+                    if frames and old_rot is not None and m.get("rot") != old_rot:
+                        _log(f"Phone rotation {old_rot} -> {m.get('rot')} deg -> orientation check + court re-lock")
+                        await asyncio.to_thread(hub.controller.on_phone_rotated, dict(hub.meta))
                 elif typ == "ping":
                     await send({"type": "pong", "t": m.get("t")})
                 elif typ == "auto_detect":

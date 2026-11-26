@@ -17,6 +17,7 @@ html,body{margin:0;height:100%;background:var(--bg);color:var(--ink);overflow:hi
 #stage{position:fixed;inset:0}
 video,#hud{position:absolute;inset:0;width:100%;height:100%;object-fit:contain;background:#000}
 #hud{display:none;z-index:2}
+#pv{position:absolute;inset:0;width:100%;height:100%;z-index:1;background:#000}
 #ov{position:absolute;inset:0;width:100%;height:100%;touch-action:none;z-index:3}
 .bar{position:absolute;left:0;right:0;display:flex;align-items:center;gap:8px;padding:10px 12px;z-index:5;pointer-events:none}
 .bar>*{pointer-events:auto}
@@ -56,6 +57,7 @@ button.small{min-height:36px;padding:7px 12px;font-size:13px;border-radius:999px
 <body>
 <div id="stage">
   <video id="video" playsinline muted autoplay></video>
+  <canvas id="pv" aria-hidden="true"></canvas>
   <img id="hud" alt="PadelIQ analyzed HUD stream">
   <canvas id="ov" aria-label="Court overlay - drag the four corner handles"></canvas>
 </div>
@@ -65,12 +67,13 @@ button.small{min-height:36px;padding:7px 12px;font-size:13px;border-radius:999px
   <span class="chip" id="c-cal"><span class="dot"></span><span id="t-cal">Court: -</span></span>
   <span class="chip" id="c-stats" style="display:none"><span id="t-stats"></span></span>
   <span class="spacer"></span>
+  <button class="small" id="b-rot" aria-label="Rotate the transmitted image 90 degrees">&#x1F504; Rotate 90&deg;</button>
   <button class="small" id="b-lens" style="display:none" aria-label="Switch lens (Rear Wide 1x / Ultra-Wide 0.5x)">Rear Wide 1x</button>
   <button class="small" id="b-hud" style="display:none" aria-pressed="false">HUD</button>
   <button class="small" id="b-fs" aria-label="Fullscreen">&#x26F6;</button>
 </div>
 <div id="msg" role="status" aria-live="polite"></div>
-<div id="rotate">Rotate the phone to landscape for full-court coverage</div>
+<div id="rotate">Portrait frame - turn the phone sideways or tap &#x1F504; Rotate 90&deg;</div>
 <div class="bar bottom">
   <button id="b-auto">&#x1F3AF; Auto-Detect Court</button>
   <button id="b-reset" style="display:none">Re-calibrate</button>
@@ -110,6 +113,19 @@ let stream = null, track = null, ws = null, wsBackoff = 500, inFlight = 0, sent 
 let corners = null, calib = {}, dragIdx = -1, localEditUntil = 0, lastCornerSend = 0, edited = false;
 let lensOptions = [], lensIdx = 0, metaKey = "", hudOn = false, busy = {};
 const grab = document.createElement("canvas");
+const pv = $("#pv"), pctx = pv.getContext("2d", {alpha:false});
+
+/* ---------------- rotation: never stretch, always rotate ----------------
+   Portrait-locked phones held sideways deliver a portrait buffer of a sideways scene. The frame is rotated
+   in the canvas (translate + rotate) so the JPEG is a true, un-stretched landscape image. null = automatic. */
+let rot = null;
+try{ const v = localStorage.getItem("padeliq_rot"); if(v !== null && v !== "") rot = (+v) % 360; }catch(e){}
+function curRot(){ return rot !== null ? rot : ((video.videoHeight > video.videoWidth) ? 90 : 0); }
+function outDims(){ const vw = video.videoWidth || 16, vh = video.videoHeight || 9; return curRot() % 180 ? [vh, vw] : [vw, vh]; }
+function drawRotated(c, x, y, W, H){        // video -> W x H box (rotated dims) at x, y
+  const r = curRot(), dw = r % 180 ? H : W, dh = r % 180 ? W : H;
+  c.save(); c.translate(x + W / 2, y + H / 2); c.rotate(r * Math.PI / 180); c.drawImage(video, -dw / 2, -dh / 2, dw, dh); c.restore();
+}
 const gctx = grab.getContext("2d", {alpha:false, desynchronized:true}) || grab.getContext("2d");
 
 /* ---------------- messages ---------------- */
@@ -180,11 +196,12 @@ function sendMeta(force){
   if(!video.videoWidth) return;
   const s = track && track.getSettings ? track.getSettings() : {};
   const lens = lensOptions[lensIdx] ? lensOptions[lensIdx].label + (lensOptions[lensIdx].name ? " " + lensOptions[lensIdx].name : "") : (track ? track.label : "");
-  const m = {type:"meta", w:video.videoWidth, h:video.videoHeight, orientation:orientation(), lens:lens || "rear camera",
+  const [ow, oh] = outDims();
+  const m = {type:"meta", w:ow, h:oh, rot:curRot(), orientation:orientation(), lens:lens || "rear camera",
              zoom:s.zoom || 1, facing:s.facingMode || "environment", fps:s.frameRate || null, track_w:s.width || null, track_h:s.height || null,
              lenses:lensOptions.map(o => o.label), ua:navigator.userAgent.slice(0, 160)};
-  const key = [m.w, m.h, m.orientation, m.lens, m.zoom].join("|");
-  $("#rotate").style.display = m.h > m.w ? "block" : "none";
+  const key = [m.w, m.h, m.rot, m.orientation, m.lens, m.zoom].join("|");
+  $("#rotate").style.display = m.h > m.w ? "block" : "none";   // transmitted frame still portrait
   if(!force && key === metaKey) return;
   metaKey = key;
   if(ws && ws.readyState === 1) ws.send(JSON.stringify(m));
@@ -202,10 +219,10 @@ function pump(){
   if(ws && ws.readyState === 1 && inFlight < MAX_IN_FLIGHT && ws.bufferedAmount < MAX_BUFFERED && video.videoWidth &&
      !document.hidden && now - lastSendT >= 1000 / TARGET_FPS - 4){
     lastSendT = now;
-    const vw = video.videoWidth, vh = video.videoHeight, k = Math.min(1, SEND_LONG_EDGE / Math.max(vw, vh));
-    const w = Math.round(vw * k), h = Math.round(vh * k);
+    const [ow, oh] = outDims(), k = Math.min(1, SEND_LONG_EDGE / Math.max(ow, oh));
+    const w = Math.round(ow * k), h = Math.round(oh * k);           // uniform scale: never stretched
     if(grab.width !== w || grab.height !== h){ grab.width = w; grab.height = h; }
-    gctx.drawImage(video, 0, 0, w, h);
+    drawRotated(gctx, 0, 0, w, h);
     inFlight++;
     grab.toBlob(b => {
       if(b && ws && ws.readyState === 1){ ws.send(b); sent++; const t = performance.now(); sendT.push(t);
@@ -315,14 +332,19 @@ function solveH(src, dst){ // 4-point DLT: src (court m) -> dst (normalised imag
 }
 function proj(h, x, y){ const w = h[6]*x + h[7]*y + h[8]; return [(h[0]*x + h[1]*y + h[2]) / w, (h[3]*x + h[4]*y + h[5]) / w]; }
 function box(){ // displayed video rect (object-fit: contain) in CSS px
-  const W = ov.clientWidth, H = ov.clientHeight, vw = video.videoWidth || 16, vh = video.videoHeight || 9;
+  const W = ov.clientWidth, H = ov.clientHeight, [vw, vh] = outDims();
   const s = Math.min(W / vw, H / vh); return {x:(W - vw*s) / 2, y:(H - vh*s) / 2, w:vw*s, h:vh*s, W, H};
 }
 const toScreen = (b, p) => [b.x + p[0] * b.w, b.y + p[1] * b.h];
-function resize(){ const d = window.devicePixelRatio || 1; ov.width = Math.round(ov.clientWidth * d); ov.height = Math.round(ov.clientHeight * d); }
+function resize(){ const d = window.devicePixelRatio || 1; ov.width = Math.round(ov.clientWidth * d); ov.height = Math.round(ov.clientHeight * d);
+  pv.width = Math.round(pv.clientWidth * d); pv.height = Math.round(pv.clientHeight * d); }
 window.addEventListener("resize", () => { resize(); sendMeta(false); });
 function draw(){
   const d = window.devicePixelRatio || 1; ctx.setTransform(d, 0, 0, d, 0, 0); ctx.clearRect(0, 0, ov.clientWidth, ov.clientHeight);
+  if(video.videoWidth && !hudOn){                       // live preview = exactly what is transmitted
+    const pb = box(); pctx.setTransform(d, 0, 0, d, 0, 0); pctx.fillStyle = "#000"; pctx.fillRect(0, 0, pb.W, pb.H);
+    drawRotated(pctx, pb.x, pb.y, pb.w, pb.h);
+  }
   if(corners && !hudOn){
     const b = box(), h = solveH(COURT, corners);
     if(h){
@@ -374,6 +396,13 @@ $("#b-hud").addEventListener("click", () => { hudOn = !hudOn; $("#b-hud").setAtt
   hudImg.style.display = hudOn ? "block" : "none"; hudImg.src = hudOn ? `/api/mobile/hud.mjpg?k=${encodeURIComponent(TOKEN)}&t=${Date.now()}` : ""; });
 $("#b-fs").addEventListener("click", goFullscreen);
 $("#b-lens").addEventListener("click", switchLens);
+$("#b-rot").addEventListener("click", () => {
+  rot = (curRot() + 90) % 360;
+  try{ localStorage.setItem("padeliq_rot", String(rot)); }catch(e){}
+  corners = null; edited = false; localEditUntil = 0;     // the stage re-detects and re-locks the court
+  sendMeta(true);
+  say(`Rotated to ${rot}\u00B0 - the stage re-checks orientation and re-locks the court`);
+});
 function goFullscreen(){ const el = document.documentElement;
   (el.requestFullscreen || el.webkitRequestFullscreen || (() => Promise.resolve())).call(el).catch(() => {});
   try{ screen.orientation && screen.orientation.lock && screen.orientation.lock("landscape").catch(() => {}); }catch(e){} }
