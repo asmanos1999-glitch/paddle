@@ -1,0 +1,57 @@
+{
+  "frame_size": [
+    1280,
+    720
+  ],
+  "corners": [
+    [
+      386.5565185546875,
+      361.9195251464844
+    ],
+    [
+      903.6281127929688,
+      362.1697998046875
+    ],
+    [
+      4037.260986328125,
+      1447.127685546875
+    ],
+    [
+      -2556.769287109375,
+      1394.259765625
+    ]
+  ],
+  "lab_median": [
+    136.0,
+    135.0,
+    81.0
+  ],
+  "court_hue": 108,
+  "court_sat": 169.0,
+  "floor_top_y": 361,
+  "floor_area_pct": 37.7,
+  "surface_agreement_pct": 73.8,
+  "surface_recall_pct": 100.0,
+  "line_support_pct": 94.2,
+  "ankle_containment_pct": 100.0,
+  "confidence_pct": 93.2,
+  "solver_mode": "low_baseline",
+  "method": "court_geometry_ai_low_baseline",
+  "engine": "CourtGeometryAI (Surface + 2-VP RANSAC + Pose-Ankle Hull)",
+  "angle": "Baseline",
+  "frames_used": 15,
+  "ankle_seeds": 23,
+  "solve_ms": 1213.0,
+  "vp_long": [
+    642.2,
+    274.4
+  ],
+  "vp_trans": [
+    -57606.0,
+    501.6
+  ],
+  "detection_s": 2.35,
+  "confirmed_by": "auto (no input for 3 s)",
+  "confirmed_at": "2026-11-26T18:02:46",
+  "source_label": "SIM LOOP: clean_padel_match.mp4"
+}

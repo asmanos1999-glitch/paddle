@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Media & generated outputs (recordings, analyzed videos, verification screenshots)
+*.mp4
+*_verified.jpg
+*_preview.jpg
+*.tmp
+
+# Databases
+*.sqlite*
+
+# Secrets / certificates
+*.pem
+certs/
+
+# Large model weights (yolov8n / pose weights are small enough to ship)
+yolov8m.pt
+
+# Machine-local config & state
+webcam_profiles.json
+live_court_calibration.json
+esp32_ip.txt
+rtsp_url.txt
+youtube_url.txt

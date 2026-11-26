@@ -1,0 +1,654 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PadelIQ Command Center</title>
+<style>
+:root{
+  --bg:#07090d; --bg2:#0b0f15; --glass:rgba(22,27,36,.62); --glass-hi:rgba(34,41,54,.72);
+  --line:rgba(255,255,255,.08); --line-hi:rgba(255,255,255,.16);
+  --ink:#e8edf4; --mute:#8a96a8; --dim:#5d6878;
+  --ok:#2fd27a; --warn:#ffb020; --bad:#ff4d5e; --accent:#3ee0c4; --accent2:#5b8cff;
+  --p1:#ff6e00; --p2:#32dc32; --p3:#dcdc00; --p4:#ff69b4;
+  --r:14px; --gap:14px;
+  --mono:ui-monospace,"Cascadia Mono","Consolas",monospace;
+  --sans:"Segoe UI Variable","Segoe UI",system-ui,-apple-system,Roboto,Helvetica,Arial,sans-serif;
+}
+*{box-sizing:border-box}
+html,body{margin:0;background:var(--bg);color:var(--ink);font-family:var(--sans);font-size:14px}
+body{min-height:100vh;background:
+  radial-gradient(1200px 600px at 10% -10%,rgba(62,224,196,.07),transparent 60%),
+  radial-gradient(900px 500px at 110% 10%,rgba(91,140,255,.08),transparent 60%),var(--bg)}
+button,input,select{font:inherit;color:inherit}
+.num{font-variant-numeric:tabular-nums;font-family:var(--mono)}
+
+/* ---------- top bar ---------- */
+.top{display:flex;align-items:center;gap:16px;padding:12px 20px;border-bottom:1px solid var(--line);
+  background:rgba(7,9,13,.75);backdrop-filter:blur(10px);position:sticky;top:0;z-index:20;flex-wrap:wrap}
+.brand{display:flex;align-items:center;gap:10px;font-weight:650;letter-spacing:.02em}
+.logo{width:30px;height:30px;border-radius:9px;background:conic-gradient(from 210deg,var(--accent),var(--accent2),var(--accent));
+  display:grid;place-items:center;color:#06110f;font-weight:800;font-size:15px}
+.brand small{display:block;font-weight:500;color:var(--mute);font-size:11px;letter-spacing:.08em;text-transform:uppercase}
+.pill{display:inline-flex;align-items:center;gap:7px;padding:5px 11px;border-radius:999px;border:1px solid var(--line-hi);
+  font-size:12px;font-weight:600;letter-spacing:.04em;background:var(--glass)}
+.dot{width:8px;height:8px;border-radius:50%;background:var(--dim)}
+.pill.live .dot{background:var(--ok);box-shadow:0 0 0 0 rgba(47,210,122,.6);animation:pulse 1.6s infinite}
+.pill.warn .dot{background:var(--warn)} .pill.bad .dot{background:var(--bad)}
+@keyframes pulse{0%{box-shadow:0 0 0 0 rgba(47,210,122,.55)}70%{box-shadow:0 0 0 8px rgba(47,210,122,0)}100%{box-shadow:0 0 0 0 rgba(47,210,122,0)}}
+.perf{font-family:var(--mono);font-size:11.5px;letter-spacing:0;gap:0;padding:5px 4px}
+.perf span{padding:0 8px;border-left:1px solid var(--line-hi);white-space:nowrap}
+.perf span:first-child{border-left:0}
+.perf b{font-weight:650;color:var(--ink)} .perf small{color:var(--mute);font-size:10.5px;margin-left:2px}
+.perf .good{color:var(--ok)} .perf .mid{color:var(--warn)} .perf .slow{color:var(--bad)}
+.srclabel{color:var(--mute);font-size:12px;max-width:420px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.spacer{flex:1}
+.clock{font-family:var(--mono);color:var(--mute);font-size:12px}
+.btn{border:1px solid var(--line-hi);background:var(--glass-hi);padding:7px 12px;border-radius:9px;cursor:pointer;
+  font-size:12.5px;font-weight:600;transition:background .15s,border-color .15s;white-space:nowrap}
+.btn:hover{background:rgba(52,62,80,.85);border-color:rgba(255,255,255,.25)}
+.btn:focus-visible,.seg button:focus-visible,input:focus-visible,select:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.btn.primary{background:linear-gradient(180deg,#38d9bd,#23b89e);color:#04140f;border-color:transparent}
+.btn.primary:hover{filter:brightness(1.08)}
+.btn.danger{border-color:rgba(255,77,94,.45);color:#ffc2c8}
+.btn[disabled]{opacity:.45;cursor:not-allowed}
+
+/* ---------- bento grid ---------- */
+.grid{display:grid;grid-template-columns:repeat(12,minmax(0,1fr));gap:var(--gap);padding:var(--gap) 20px 28px;max-width:1800px;margin:0 auto}
+.card{background:var(--glass);border:1px solid var(--line);border-radius:var(--r);backdrop-filter:blur(14px);
+  box-shadow:0 1px 0 rgba(255,255,255,.04) inset,0 18px 40px -24px rgba(0,0,0,.8);min-width:0}
+.card h3{margin:0;font-size:11.5px;letter-spacing:.12em;text-transform:uppercase;color:var(--mute);font-weight:650}
+.card .hd{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:12px 14px 0}
+.card .bd{padding:12px 14px 14px}
+.c-video{grid-column:span 8;grid-row:span 2}
+.c-map{grid-column:span 4;grid-row:span 2}
+.c-p{grid-column:span 3}
+.c-src{grid-column:span 4}
+.c-feed{grid-column:span 5}
+.c-health{grid-column:span 3}
+@media (max-width:1280px){.c-video{grid-column:span 12}.c-map{grid-column:span 6;grid-row:auto}.c-src{grid-column:span 6}
+  .c-p{grid-column:span 6}.c-feed{grid-column:span 6}.c-health{grid-column:span 6}}
+@media (max-width:760px){.grid{padding:12px;gap:12px}.c-map,.c-src,.c-p,.c-feed,.c-health{grid-column:span 12}.top{padding:10px 12px}}
+
+/* ---------- video ---------- */
+.viewport{position:relative;margin:12px 14px 0;border-radius:10px;overflow:hidden;background:#000;aspect-ratio:16/9;border:1px solid var(--line)}
+.viewport img{position:absolute;inset:0;width:100%;height:100%;object-fit:contain;display:block}
+#calib-img{display:none}
+#calib-canvas{position:absolute;inset:0;width:100%;height:100%;display:none;cursor:crosshair}
+.viewport.calibrating #calib-img,.viewport.calibrating #calib-canvas{display:block}
+.calib-bar{position:absolute;left:12px;right:12px;bottom:12px;display:none;gap:8px;align-items:center;flex-wrap:wrap;
+  padding:10px 12px;border-radius:10px;background:rgba(5,7,10,.82);border:1px solid var(--line-hi);backdrop-filter:blur(8px)}
+.viewport.calibrating .calib-bar{display:flex}
+.calib-bar .msg{flex:1;min-width:200px;font-size:12.5px}
+.review-bar{position:absolute;left:12px;right:12px;top:12px;display:none;gap:8px;align-items:center;flex-wrap:wrap;
+  padding:10px 12px;border-radius:10px;background:rgba(5,7,10,.86);border:1px solid #2fd3e0;backdrop-filter:blur(8px);z-index:3}
+.review-bar.show{display:flex}
+.review-bar .msg{flex:1;min-width:220px;font-size:12.5px;line-height:1.35}
+.review-bar .msg b{color:#2fd3e0}
+.review-bar.failed{border-color:var(--warn)} .review-bar.failed .msg b{color:var(--warn)}
+.viewport.dragging #calib-img,.viewport.dragging #calib-canvas{display:block}
+.viewport.dragging #calib-canvas{cursor:grab}
+.viewport.dragging .calib-bar{display:none}
+.toolbar{display:flex;gap:8px;flex-wrap:wrap;padding:12px 14px 14px;align-items:center}
+.toolbar .sep{width:1px;height:22px;background:var(--line-hi);margin:0 2px}
+select{background:var(--bg2);border:1px solid var(--line-hi);border-radius:8px;padding:6px 8px;font-size:12.5px}
+
+/* ---------- segmented ---------- */
+.seg{display:inline-flex;background:var(--bg2);border:1px solid var(--line-hi);border-radius:9px;padding:3px;gap:2px;flex-wrap:wrap}
+.seg button{border:0;background:transparent;padding:5px 10px;border-radius:7px;cursor:pointer;font-size:12px;font-weight:600;color:var(--mute)}
+.seg button[aria-pressed="true"]{background:var(--glass-hi);color:var(--ink);box-shadow:0 0 0 1px var(--line-hi) inset}
+
+/* ---------- minimap ---------- */
+.mapwrap{display:flex;justify-content:center;padding:12px 14px 14px}
+#minimap{width:100%;max-width:330px;aspect-ratio:1/1.9;display:block}
+.legend{display:flex;gap:12px;flex-wrap:wrap;padding:0 14px 14px;font-size:12px;color:var(--mute)}
+.legend i{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:5px;vertical-align:-1px}
+
+/* ---------- player cards ---------- */
+.pcard{position:relative;overflow:hidden}
+.pcard::before{content:"";position:absolute;left:0;top:0;bottom:0;width:3px;background:var(--pc)}
+.ptitle{display:flex;align-items:center;gap:9px}
+.badge{width:30px;height:30px;border-radius:9px;display:grid;place-items:center;font-weight:800;font-size:13px;color:#0a0a0a;background:var(--pc)}
+.pstate{font-size:11px;font-weight:650;letter-spacing:.06em;text-transform:uppercase;color:var(--dim)}
+.pstate.on{color:var(--ok)}
+.speed{display:flex;align-items:baseline;gap:6px;margin:10px 0 2px}
+.speed b{font-size:30px;font-weight:700;letter-spacing:-.02em;font-family:var(--mono)}
+.speed span{color:var(--mute);font-size:12px}
+.kv{display:grid;grid-template-columns:1fr auto;gap:5px 10px;font-size:12.5px;margin-top:8px}
+.kv dt{color:var(--mute)} .kv dd{margin:0;text-align:right;font-family:var(--mono)}
+.bar{height:6px;border-radius:99px;background:rgba(255,255,255,.07);overflow:hidden;margin:3px 0 7px}
+.bar>i{display:block;height:100%;width:0;border-radius:99px;background:var(--pc);transition:width .4s ease}
+.barlbl{display:flex;justify-content:space-between;font-size:12px;color:var(--mute);margin-top:8px}
+.barlbl b{color:var(--ink);font-family:var(--mono);font-weight:600}
+
+/* ---------- source ---------- */
+.srcform{display:flex;gap:8px;margin-top:10px}
+.srcform input{flex:1;min-width:0;background:var(--bg2);border:1px solid var(--line-hi);border-radius:9px;padding:8px 10px;font-size:13px}
+.hint{font-size:12px;color:var(--mute);margin-top:8px;min-height:16px}
+.hint.err{color:#ff9aa4}
+
+/* ---------- feed ---------- */
+.feed{list-style:none;margin:0;padding:0;max-height:300px;overflow:auto}
+.feed li{display:grid;grid-template-columns:auto auto 1fr;gap:10px;align-items:baseline;padding:8px 2px;border-bottom:1px solid var(--line);font-size:13px}
+.feed li:last-child{border-bottom:0}
+.feed time{font-family:var(--mono);color:var(--dim);font-size:11.5px}
+.feed .tag{font-weight:800;font-size:11.5px;padding:2px 7px;border-radius:6px;color:#0a0a0a}
+.empty{color:var(--dim);font-size:13px;padding:10px 2px}
+
+/* ---------- health ---------- */
+.hgrid{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+.metric{background:rgba(255,255,255,.03);border:1px solid var(--line);border-radius:10px;padding:9px 10px}
+.metric span{display:block;font-size:10.5px;letter-spacing:.08em;text-transform:uppercase;color:var(--mute)}
+.metric b{font-size:18px;font-family:var(--mono);font-weight:650}
+.metric small{color:var(--dim);font-size:11px;margin-left:3px}
+
+/* ---------- toast ---------- */
+#toast{position:fixed;right:18px;bottom:18px;display:flex;flex-direction:column;gap:8px;z-index:50}
+.t{background:rgba(14,18,25,.95);border:1px solid var(--line-hi);border-left:3px solid var(--accent);padding:10px 14px;border-radius:10px;
+  font-size:13px;max-width:380px;box-shadow:0 10px 30px rgba(0,0,0,.5);animation:in .2s ease}
+.t.err{border-left-color:var(--bad)}
+@keyframes in{from{transform:translateY(8px);opacity:0}to{transform:none;opacity:1}}
+@media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
+</style>
+</head>
+<body>
+<header class="top">
+  <div class="brand"><div class="logo" aria-hidden="true">P</div><div>PadelIQ Command Center<small>AI Sports Analytics &middot; Enterprise</small></div></div>
+  <span id="live-pill" class="pill"><span class="dot"></span><span id="live-text">CONNECTING</span></span>
+  <span id="perf-pill" class="pill perf" title="Live latency &amp; FPS profiler (E2E = frame captured -> annotated JPEG ready)">
+    <span>Capture <b id="pf-cap">&ndash;</b><small>fps</small></span><span>Render <b id="pf-ren">&ndash;</b><small>fps</small></span><span>AI <b id="pf-ai">&ndash;</b><small>ms</small></span><span>E2E <b id="pf-e2e">&ndash;</b><small>ms</small></span>
+  </span>
+  <span id="src-label" class="srclabel">&mdash;</span>
+  <span class="spacer"></span>
+  <span class="clock">Session <b id="session" class="num">00:00</b> &middot; <span id="clock" class="num"></span></span>
+  <button class="btn" id="btn-json" title="Download JSON report">Export JSON</button>
+  <button class="btn" id="btn-csv" title="Download CSV report">CSV</button>
+  <button class="btn primary" id="btn-html" title="Open printable executive summary">Official Report</button>
+</header>
+
+<main class="grid">
+  <!-- Video -->
+  <section class="card c-video" aria-label="Live video">
+    <div class="hd"><h3>Live Analyzed Stream</h3><span class="num" id="fps-chip" style="color:var(--mute);font-size:12px">&ndash;</span></div>
+    <div class="viewport" id="viewport">
+      <img id="stream" alt="Annotated live video stream" src="/video.mjpg">
+      <img id="calib-img" alt="Frozen frame for calibration">
+      <canvas id="calib-canvas" aria-label="Calibration click area"></canvas>
+      <div class="review-bar" id="review-bar" role="status" aria-live="polite">
+        <span class="msg" id="review-msg"></span>
+        <button class="btn primary" id="rv-confirm">Confirm [Enter]</button>
+        <button class="btn" id="rv-adjust">Drag Corners [C]</button>
+        <button class="btn" id="rv-fresh">4 Fresh Corners [N]</button>
+        <button class="btn" id="rv-rerun">Re-Scan [A]</button>
+      </div>
+      <div class="calib-bar">
+        <span class="msg" id="calib-msg">Click the 4 court points.</span>
+        <button class="btn" id="calib-undo">Undo</button>
+        <button class="btn" id="calib-cancel">Cancel</button>
+        <button class="btn primary" id="calib-apply" disabled>Apply</button>
+      </div>
+    </div>
+    <div class="toolbar">
+      <label class="sr" for="calib-ref" style="font-size:12px;color:var(--mute)">Reference</label>
+      <select id="calib-ref">
+        <option value="far_half">Far half (far corners + net)</option>
+        <option value="full">Full court (4 corners)</option>
+        <option value="near_half">Near half (net + near corners)</option>
+      </select>
+      <button class="btn" id="btn-calib">Calibrate [C]</button>
+      <button class="btn" id="btn-auto">Auto-calibrate [A]</button>
+      <span class="sep"></span>
+      <div class="seg" role="group" aria-label="HUD mode">
+        <button data-hud="compact" aria-pressed="true">Compact HUD</button>
+        <button data-hud="full" aria-pressed="false">Full HUD</button>
+      </div>
+      <span class="sep"></span>
+      <button class="btn" id="btn-snap">Snapshot</button>
+      <button class="btn danger" id="btn-reset">Reset stats</button>
+    </div>
+  </section>
+
+  <!-- Minimap -->
+  <section class="card c-map" aria-label="Digital twin court">
+    <div class="hd"><h3>2D Digital Twin</h3>
+      <div class="seg" role="group" aria-label="Map mode">
+        <button data-map="radar" aria-pressed="true">Radar</button>
+        <button data-map="heat" aria-pressed="false">Heatmap</button>
+      </div>
+    </div>
+    <div class="mapwrap"><canvas id="minimap" width="330" height="627" aria-label="Court map"></canvas></div>
+    <div class="legend" id="legend"></div>
+  </section>
+
+  <!-- Player cards -->
+  <section class="card c-p pcard" id="p1" style="--pc:var(--p1)"></section>
+  <section class="card c-p pcard" id="p2" style="--pc:var(--p2)"></section>
+  <section class="card c-p pcard" id="p3" style="--pc:var(--p3)"></section>
+  <section class="card c-p pcard" id="p4" style="--pc:var(--p4)"></section>
+
+  <!-- Source -->
+  <section class="card c-src" aria-label="Source switcher">
+    <div class="hd"><h3>Source</h3><span id="src-state" style="font-size:12px;color:var(--mute)"></span></div>
+    <div class="bd">
+      <div class="seg" role="group" aria-label="Source type" id="src-seg">
+        <button data-src="sim" aria-pressed="true">Match Replay</button>
+        <button data-src="webcam" aria-pressed="false">Webcam</button>
+        <button data-src="esp32" aria-pressed="false">ESP32-CAM</button>
+        <button data-src="rtsp" aria-pressed="false">RTSP</button>
+        <button data-src="youtube" aria-pressed="false">YouTube</button>
+        <button data-src="auto" aria-pressed="false">Auto</button>
+      </div>
+      <form class="srcform" id="src-form">
+        <input id="src-input" aria-label="Source value" placeholder="Clean match footage (no input needed)" autocomplete="off">
+        <button class="btn primary" type="submit">Connect</button>
+      </form>
+      <div class="hint" id="src-hint"></div>
+    </div>
+  </section>
+
+  <!-- Coach feed -->
+  <section class="card c-feed" aria-label="AI coach feed">
+    <div class="hd"><h3>AI Tactical Coach Feed</h3><span style="font-size:12px;color:var(--mute)" id="feed-count"></span></div>
+    <div class="bd"><ul class="feed" id="feed"><li class="empty">Waiting for tracked players&hellip;</li></ul></div>
+  </section>
+
+  <!-- Health -->
+  <section class="card c-health" aria-label="System health">
+    <div class="hd"><h3>System Health</h3><span id="health-ok" style="font-size:12px;color:var(--ok)"></span></div>
+    <div class="bd"><div class="hgrid">
+      <div class="metric"><span>Capture</span><b id="h-cap">&ndash;</b><small>fps</small></div>
+      <div class="metric"><span>AI inference</span><b id="h-inf">&ndash;</b><small>fps</small></div>
+      <div class="metric"><span>Render</span><b id="h-ren">&ndash;</b><small>fps</small></div>
+      <div class="metric"><span>AI latency</span><b id="h-lat">&ndash;</b><small>ms</small></div>
+      <div class="metric"><span>CPU</span><b id="h-cpu">&ndash;</b><small>%</small></div>
+      <div class="metric"><span>Memory</span><b id="h-mem">&ndash;</b><small>MB</small></div>
+      <div class="metric"><span>Reconnects</span><b id="h-rec">&ndash;</b></div>
+      <div class="metric"><span>Uptime</span><b id="h-up">&ndash;</b></div>
+    </div></div>
+  </section>
+</main>
+<div id="toast" role="status" aria-live="polite"></div>
+
+<script>
+"use strict";
+const $ = s => document.querySelector(s);
+const COLORS = {P1:"#ff6e00",P2:"#32dc32",P3:"#dcdc00",P4:"#ff69b4"};
+const COURT = {W:10, L:20, NET:10, SVC:6.95};
+let mapMode = "radar", lastTel = null, lastHeat = null;
+
+function toast(msg, isErr){
+  const el = document.createElement("div"); el.className = "t" + (isErr ? " err" : ""); el.textContent = msg;
+  $("#toast").appendChild(el); setTimeout(() => el.remove(), isErr ? 6000 : 3500);
+}
+async function api(path, body){
+  try{
+    const r = await fetch(path, body === undefined ? {} : {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(body)});
+    const j = await r.json().catch(() => ({}));
+    if(!r.ok || j.ok === false) throw new Error(j.error || ("HTTP " + r.status));
+    return j;
+  }catch(e){ toast(e.message, true); throw e; }
+}
+const fmtT = s => { s = Math.max(0, Math.floor(s||0)); const h = Math.floor(s/3600), m = Math.floor(s%3600/60), x = s%60;
+  return (h ? h + ":" + String(m).padStart(2,"0") : String(m).padStart(2,"0")) + ":" + String(x).padStart(2,"0"); };
+const f1 = v => (v === null || v === undefined) ? "–" : Number(v).toFixed(1);
+
+/* ---------- player cards ---------- */
+function cardHTML(id){
+  return `<div class="hd"><div class="ptitle"><div class="badge">${id}</div><div><h3>Player ${id.slice(1)}</h3>
+    <div class="pstate" data-k="state">No signal</div></div></div><span class="num" data-k="pos" style="color:var(--dim);font-size:11.5px"></span></div>
+  <div class="bd"><div class="speed"><b data-k="spd">0.0</b><span>m/s</span><span data-k="kmh" class="num">0.0 km/h</span></div>
+  <dl class="kv"><dt>Avg speed</dt><dd data-k="avg">–</dd><dt>Top speed</dt><dd data-k="max">–</dd>
+  <dt>Distance</dt><dd data-k="dist">–</dd><dt>Active time</dt><dd data-k="act">–</dd></dl>
+  <div class="barlbl"><span>Court coverage</span><b data-k="cov">0%</b></div><div class="bar"><i data-k="covbar"></i></div>
+  <div class="barlbl"><span>Stability index</span><b data-k="stab">–</b></div><div class="bar"><i data-k="stabbar"></i></div></div>`;
+}
+["P1","P2","P3","P4"].forEach(id => $("#" + id.toLowerCase()).innerHTML = cardHTML(id));
+function setK(root, k, v){ const el = root.querySelector(`[data-k="${k}"]`); if(el && el.textContent !== v) el.textContent = v; }
+function renderPlayers(players){
+  for(const p of players){
+    const root = $("#" + p.id.toLowerCase());
+    const st = root.querySelector('[data-k="state"]');
+    st.textContent = p.active ? "Tracking" : (p.tracked ? "Occluded" : "No signal");
+    st.classList.toggle("on", p.active);
+    setK(root, "spd", f1(p.speed_ms)); setK(root, "kmh", f1(p.speed_kmh) + " km/h");
+    setK(root, "avg", `${p.avg_speed_ms.toFixed(2)} m/s · ${f1(p.avg_speed_kmh)} km/h`);
+    setK(root, "max", `${p.max_speed_ms.toFixed(2)} m/s`);
+    setK(root, "dist", `${f1(p.distance_m)} m`);
+    setK(root, "act", `${f1(p.active_s)} s · ${p.active_pct}%`);
+    setK(root, "cov", `${f1(p.coverage_pct)}%`);
+    setK(root, "stab", `${f1(p.stability_pct)}%`);
+    setK(root, "pos", p.pos_m ? `x ${p.pos_m[0].toFixed(1)} · y ${p.pos_m[1].toFixed(1)} m` : "");
+    root.querySelector('[data-k="covbar"]').style.width = Math.min(100, p.coverage_pct) + "%";
+    root.querySelector('[data-k="stabbar"]').style.width = (p.tracked ? Math.min(100, p.stability_pct) : 0) + "%";
+  }
+}
+
+/* ---------- minimap ---------- */
+const mm = $("#minimap"), mctx = mm.getContext("2d");
+function heatColor(v){ // dark teal -> cyan -> yellow -> red
+  const stops = [[0,[10,40,60]],[.35,[40,200,200]],[.7,[250,220,60]],[1,[255,60,60]]];
+  for(let i=1;i<stops.length;i++){ if(v <= stops[i][0]){ const a = stops[i-1], b = stops[i], t = (v-a[0])/(b[0]-a[0]);
+    return a[1].map((c,j) => Math.round(c + (b[1][j]-c)*t)); } }
+  return stops[stops.length-1][1];
+}
+function drawMap(tel){
+  const dpr = window.devicePixelRatio || 1, cw = mm.clientWidth || 330, ch = cw * 1.9;
+  if(mm.width !== Math.round(cw*dpr)){ mm.width = Math.round(cw*dpr); mm.height = Math.round(ch*dpr); }
+  mctx.setTransform(dpr,0,0,dpr,0,0); mctx.clearRect(0,0,cw,ch);
+  const pad = 18, iw = cw - 2*pad, ih = iw*2, oy = (ch - ih)/2;
+  const X = x => pad + Math.min(COURT.W, Math.max(0, x))/COURT.W*iw, Y = y => oy + Math.min(COURT.L, Math.max(0, y))/COURT.L*ih;
+  const g = mctx.createLinearGradient(0,oy,0,oy+ih); g.addColorStop(0,"#123a7a"); g.addColorStop(1,"#0f2f66");
+  mctx.fillStyle = g; mctx.fillRect(pad,oy,iw,ih);
+  if(mapMode === "heat" && lastHeat && lastHeat.max_s > 0){
+    const cwid = iw/lastHeat.cols, chgt = ih/lastHeat.rows;
+    for(let r=0;r<lastHeat.rows;r++) for(let c=0;c<lastHeat.cols;c++){
+      const v = lastHeat.values[r*lastHeat.cols+c]; if(v <= 0.01) continue;
+      const [R,G,B] = heatColor(Math.sqrt(v)); mctx.fillStyle = `rgba(${R},${G},${B},${0.25+0.6*Math.sqrt(v)})`;
+      mctx.fillRect(pad+c*cwid, oy+r*chgt, cwid+.5, chgt+.5);
+    }
+  }
+  mctx.strokeStyle = "rgba(255,255,255,.9)"; mctx.lineWidth = 2; mctx.strokeRect(pad,oy,iw,ih);
+  mctx.lineWidth = 1.2; mctx.strokeStyle = "rgba(255,255,255,.75)"; mctx.beginPath();
+  for(const y of [COURT.NET-COURT.SVC, COURT.NET+COURT.SVC]){ mctx.moveTo(X(0),Y(y)); mctx.lineTo(X(COURT.W),Y(y)); }
+  mctx.moveTo(X(5),Y(COURT.NET-COURT.SVC)); mctx.lineTo(X(5),Y(COURT.NET+COURT.SVC)); mctx.stroke();
+  mctx.lineWidth = 3.5; mctx.strokeStyle = "#fff"; mctx.beginPath(); mctx.moveTo(X(0)-6,Y(10)); mctx.lineTo(X(10)+6,Y(10)); mctx.stroke();
+  mctx.fillStyle = "rgba(255,255,255,.55)"; mctx.font = "600 10px " + getComputedStyle(document.body).fontFamily;
+  mctx.fillText("NET", X(10)-24, Y(10)-6);
+  if(!tel) return;
+  const labels = [];
+  for(const p of tel.players){
+    if(!p.tracked || !p.pos_m) continue;
+    const col = COLORS[p.id];
+    if(mapMode === "radar" && p.trail_m.length > 1){
+      mctx.strokeStyle = col; mctx.globalAlpha = .75; mctx.lineWidth = 2; mctx.beginPath();
+      p.trail_m.forEach((m,i) => i ? mctx.lineTo(X(m[0]),Y(m[1])) : mctx.moveTo(X(m[0]),Y(m[1]))); mctx.stroke(); mctx.globalAlpha = 1;
+    }
+    const x = X(p.pos_m[0]), y = Y(p.pos_m[1]);
+    mctx.globalAlpha = p.active ? 1 : .4;
+    const glow = mctx.createRadialGradient(x,y,0,x,y,18); glow.addColorStop(0,col+"99"); glow.addColorStop(1,col+"00");
+    mctx.fillStyle = glow; mctx.beginPath(); mctx.arc(x,y,18,0,7); mctx.fill();
+    mctx.fillStyle = col; mctx.beginPath(); mctx.arc(x,y,6.5,0,7); mctx.fill();
+    mctx.strokeStyle = "#fff"; mctx.lineWidth = 1.5; mctx.stroke();
+    // label placement avoiding other labels
+    mctx.font = "700 12px " + getComputedStyle(document.body).fontFamily;
+    const w = mctx.measureText(p.id).width;
+    const opts = [[x+10,y+4],[x-10-w,y+4],[x-w/2,y-12],[x-w/2,y+20]];
+    let best = opts[0];
+    for(const o of opts){ const r = [o[0],o[1]-11,o[0]+w,o[1]+2];
+      const inside = r[0] >= pad && r[2] <= pad+iw;
+      if(inside && !labels.some(l => !(r[2]<l[0]||l[2]<r[0]||r[3]<l[1]||l[3]<r[1]))){ best = o; break; } }
+    labels.push([best[0],best[1]-11,best[0]+w,best[1]+2]);
+    mctx.fillStyle = "#fff"; mctx.fillText(p.id, best[0], best[1]);
+    mctx.globalAlpha = 1;
+  }
+  const b = tel.ball;
+  if(b && b.visible && b.court_m){
+    if(b.court_trail_m && b.court_trail_m.length > 1){
+      mctx.strokeStyle = "rgba(255,240,120,.85)"; mctx.lineWidth = 1.8; mctx.setLineDash([4,3]); mctx.beginPath();
+      b.court_trail_m.forEach((m,i) => i ? mctx.lineTo(X(m[0]),Y(m[1])) : mctx.moveTo(X(m[0]),Y(m[1]))); mctx.stroke(); mctx.setLineDash([]);
+    }
+    const bx = X(b.court_m[0]), by = Y(b.court_m[1]), pr = 5 + 1.6*Math.abs(Math.sin(Date.now()/160));
+    const gl = mctx.createRadialGradient(bx,by,0,bx,by,16); gl.addColorStop(0,"rgba(255,255,120,.9)"); gl.addColorStop(1,"rgba(255,255,120,0)");
+    mctx.fillStyle = gl; mctx.beginPath(); mctx.arc(bx,by,16,0,7); mctx.fill();
+    mctx.fillStyle = "#fff"; mctx.beginPath(); mctx.arc(bx,by,pr,0,7); mctx.fill();
+    mctx.strokeStyle = "#e8ff3a"; mctx.lineWidth = 2; mctx.stroke();
+    mctx.font = "700 11px " + getComputedStyle(document.body).fontFamily; mctx.fillStyle = "#e8ff3a";
+    mctx.fillText(`${Math.round(b.speed_kmh)} km/h`, Math.min(bx+10, pad+iw-48), by-9);
+  }
+  if(b){ mctx.font = "600 11px " + getComputedStyle(document.body).fontFamily; mctx.fillStyle = "rgba(255,255,255,.7)";
+    mctx.fillText(`Ball: ${b.visible ? Math.round(b.speed_kmh)+" km/h" : "searching"} · Rally shots ${b.rally_shots}`, pad, oy-6); }
+}
+$("#legend").innerHTML = Object.entries(COLORS).map(([k,c]) => `<span><i style="background:${c}"></i>${k}</span>`).join("") +
+  `<span style="margin-left:auto">Service lines 6.95 m from net</span>`;
+
+/* ---------- feed / health / status ---------- */
+let feedKey = "";
+function renderFeed(feed){
+  const key = feed.length ? feed[0].t + ":" + feed.length : "";
+  if(key === feedKey) return; feedKey = key;
+  $("#feed-count").textContent = feed.length ? feed.length + " insights" : "";
+  const ul = $("#feed");
+  if(!feed.length){ ul.innerHTML = '<li class="empty">Waiting for tracked players…</li>'; return; }
+  ul.replaceChildren(...feed.map(c => { const li = document.createElement("li");
+    const t = document.createElement("time"); t.textContent = c.time;
+    const tag = document.createElement("span"); tag.className = "tag"; tag.style.background = COLORS[c.player]; tag.textContent = c.player;
+    const tx = document.createElement("span"); tx.textContent = c.text;
+    li.append(t, tag, tx); return li; }));
+}
+function renderStatus(st){
+  const pill = $("#live-pill"), cam = st.source.camera_status, state = st.source.state;
+  pill.className = "pill " + (state === "error" ? "bad" : (cam === "live" && state === "ready") ? "live" : "warn");
+  $("#live-text").textContent = state === "switching" ? "SWITCHING" : state === "error" ? "SOURCE ERROR" :
+    cam === "live" ? "LIVE" : cam === "reconnecting" ? "RECONNECTING" : "CONNECTING";
+  $("#src-label").textContent = st.source.label || "—";
+  $("#src-state").textContent = st.source.error ? "" : (st.source.kind ? st.source.kind.toUpperCase() : "");
+  if(st.source.error){ const h = $("#src-hint"); h.textContent = st.source.error; h.className = "hint err"; }
+  const pl = st.pipeline, lt = st.latency || {};
+  const setPf = (id, v, cls) => { const el = $(id); el.textContent = v; el.className = cls || ""; };
+  setPf("#pf-cap", f1(lt.capture_fps ?? pl.capture_fps), (lt.capture_fps ?? 0) >= 25 ? "good" : (lt.capture_fps ?? 0) >= 15 ? "mid" : "slow");
+  setPf("#pf-ren", f1(lt.render_fps ?? pl.render_fps), (lt.render_fps ?? 0) >= 25 ? "good" : (lt.render_fps ?? 0) >= 15 ? "mid" : "slow");
+  setPf("#pf-ai", lt.inference_ms != null ? Math.round(lt.inference_ms) : "–", "");
+  setPf("#pf-e2e", lt.e2e_ms_median != null ? Math.round(lt.e2e_ms_median) : "–",
+        lt.e2e_ms_median == null ? "" : lt.e2e_ms_median <= 40 ? "good" : lt.e2e_ms_median <= 80 ? "mid" : "slow");
+  $("#fps-chip").textContent = `${f1(pl.render_fps)} fps video · ${f1(pl.inference_fps)} fps AI`;
+  $("#h-cap").textContent = f1(pl.capture_fps); $("#h-inf").textContent = f1(pl.inference_fps);
+  $("#h-ren").textContent = f1(pl.render_fps); $("#h-lat").textContent = Math.round(pl.inference_latency_ms);
+  $("#h-cpu").textContent = st.system && st.system.cpu_pct != null ? Math.round(st.system.cpu_pct) : "–";
+  $("#h-mem").textContent = st.system && st.system.process_mb != null ? Math.round(st.system.process_mb) : "–";
+  $("#h-rec").textContent = st.source.reconnects; $("#h-up").textContent = fmtT(st.uptime_s);
+  const errs = Object.values(st.errors).reduce((a,b) => a+b, 0);
+  $("#health-ok").textContent = errs ? errs + " recovered" : "All systems nominal";
+  $("#health-ok").style.color = errs ? "var(--warn)" : "var(--ok)";
+  $("#session").textContent = fmtT(st.session_s);
+  document.querySelectorAll("[data-hud]").forEach(b => b.setAttribute("aria-pressed", String(b.dataset.hud === st.hud_mode)));
+}
+function onTelemetry(tel){
+  lastTel = tel; if(tel.heatmap) lastHeat = tel.heatmap;
+  renderPlayers(tel.players); renderFeed(tel.coach_feed); renderStatus(tel.status); drawMap(tel);
+  renderReview(tel.calibration_review);
+}
+function renderReview(rv){
+  const bar = $("#review-bar"); if(!rv) return;
+  const show = ["detecting","review","manual","failed"].includes(rv.state) && !vp.classList.contains("calibrating");
+  bar.classList.toggle("show", show); bar.classList.toggle("failed", rv.state === "failed");
+  if(!show) return;
+  const conf = rv.confidence_pct != null ? Math.round(rv.confidence_pct) + "%" : "n/a";
+  const ang = rv.angle || "Baseline";
+  const msg = rv.state === "detecting" ? "<b>Detecting court geometry…</b> scanning floor surface &amp; vanishing lines (1–2s)" :
+    rv.state === "review" ? `<b>COURT LOCKED (Confidence: ${conf} | Angle: ${ang})</b> — [ENTER] Confirm | [C] Drag Corners | [A] Re-Scan` +
+      (rv.auto_confirm_in_s != null ? ` · auto-confirm in ${rv.auto_confirm_in_s.toFixed(1)}s` : "") :
+    rv.state === "manual" ? "<b>Interactive Handle Editor</b> — drag <b>TL, TR, BR, BL, NET-L, NET-R</b> with live grid preview, or press [N] for 4 fresh corners, then Confirm [Enter/C]" :
+    `<b>Waiting for court floor</b> — ${rv.error || "scene-cut detector active"}. Press Re-Scan [A] or 4 Fresh Corners [N].`;
+  if($("#review-msg").innerHTML !== msg) $("#review-msg").innerHTML = msg;
+  $("#rv-confirm").disabled = !(rv.state === "review" || rv.state === "manual");
+  $("#rv-adjust").disabled = rv.state === "detecting" || vp.classList.contains("dragging");
+  $("#rv-rerun").disabled = rv.state === "detecting";
+}
+
+/* ---------- websocket with polling fallback ---------- */
+let ws, wsFails = 0, pollTimer = null;
+function connectWS(){
+  try{ ws = new WebSocket((location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/ws/telemetry"); }
+  catch(e){ return startPolling(); }
+  ws.onmessage = ev => { wsFails = 0; stopPolling(); try{ onTelemetry(JSON.parse(ev.data)); }catch(e){} };
+  ws.onclose = () => { wsFails++; startPolling(); setTimeout(connectWS, Math.min(8000, 800 * wsFails)); };
+  ws.onerror = () => { try{ ws.close(); }catch(e){} };
+}
+function startPolling(){ if(pollTimer) return; pollTimer = setInterval(async () => {
+  try{ const r = await fetch("/api/telemetry"); if(r.ok) onTelemetry(await r.json()); }catch(e){} }, 500); }
+function stopPolling(){ if(pollTimer){ clearInterval(pollTimer); pollTimer = null; } }
+connectWS();
+setInterval(() => { $("#clock").textContent = new Date().toLocaleTimeString(); }, 1000);
+
+/* keep MJPEG alive: reconnect the <img> if the stream stalls */
+const stream = $("#stream");
+stream.addEventListener("error", () => setTimeout(() => { stream.src = "/video.mjpg?r=" + Date.now(); }, 1500));
+
+/* ---------- segmented controls ---------- */
+function bindSeg(attr, cb){ document.querySelectorAll(`[data-${attr}]`).forEach(b => b.addEventListener("click", () => {
+  document.querySelectorAll(`[data-${attr}]`).forEach(x => x.setAttribute("aria-pressed", String(x === b))); cb(b.dataset[attr]); })); }
+bindSeg("map", m => { mapMode = m; drawMap(lastTel); });
+bindSeg("hud", m => api("/api/hud", {mode:m}).catch(() => {}));
+const SRC_HINTS = {
+  sim: ["Clean match footage (no input needed)", ""],
+  webcam: ["Empty = best camera (Logitech BRIO preferred), or index 0/1", ""],
+  esp32: ["ESP32-CAM IP, e.g. 192.168.1.50", ""],
+  rtsp: ["rtsp://user:pass@192.168.1.64:554/stream", ""],
+  youtube: ["https://www.youtube.com/watch?v=…", ""],
+  auto: ["Optional ESP32 IP to try first", ""],
+};
+let srcType = "sim";
+bindSeg("src", t => { srcType = t; const i = $("#src-input"); i.placeholder = SRC_HINTS[t][0]; i.value = SRC_HINTS[t][1];
+  i.disabled = t === "sim"; $("#src-hint").textContent = ""; });
+$("#src-input").disabled = true;
+$("#src-form").addEventListener("submit", async ev => {
+  ev.preventDefault();
+  const hint = $("#src-hint"); hint.className = "hint"; hint.textContent = "Switching…";
+  try{ const j = await api("/api/source", {type: srcType, value: $("#src-input").value});
+    hint.textContent = "Connecting to " + j.switching_to + (srcType === "youtube" ? " (resolving with yt-dlp…)" : "");
+  }catch(e){ hint.className = "hint err"; hint.textContent = e.message; }
+});
+
+/* ---------- toolbar ---------- */
+$("#btn-reset").addEventListener("click", async () => { await api("/api/reset", {}); toast("Statistics reset"); });
+$("#btn-snap").addEventListener("click", () => window.open("/api/snapshot?t=" + Date.now(), "_blank"));
+$("#btn-json").addEventListener("click", () => { location.href = "/api/report.json"; });
+$("#btn-csv").addEventListener("click", () => { location.href = "/api/report.csv"; });
+$("#btn-html").addEventListener("click", () => window.open("/api/report.html", "_blank"));
+$("#btn-auto").addEventListener("click", async ev => {
+  const b = ev.currentTarget; b.disabled = true; b.textContent = "Detecting court…";
+  try{ const j = await api("/api/calibration/auto", {});
+    toast(`AI auto-calibration ready (confidence ${Math.round(j.info.confidence_pct || 0)}%) - review and confirm`); }
+  catch(e){} finally{ b.disabled = false; b.textContent = "Auto-calibrate"; }
+});
+
+/* ---------- on-screen calibration ---------- */
+const vp = $("#viewport"), cimg = $("#calib-img"), cc = $("#calib-canvas"), cctx = cc.getContext("2d");
+let cpts = [], frameSize = null;
+const REF_STEPS = {
+  full: ["far-left corner", "far-right corner", "near-right corner", "near-left corner"],
+  far_half: ["far-left corner", "far-right corner", "net (floor) at right wall", "net (floor) at left wall"],
+  near_half: ["net (floor) at left wall", "net (floor) at right wall", "near-right corner", "near-left corner"],
+};
+function imgBox(){ // letterboxed image rectangle inside the viewport (object-fit: contain)
+  const r = vp.getBoundingClientRect(), fw = frameSize[0], fh = frameSize[1];
+  const s = Math.min(r.width/fw, r.height/fh), w = fw*s, h = fh*s;
+  return {x:(r.width-w)/2, y:(r.height-h)/2, s, w, h, rw:r.width, rh:r.height};
+}
+function drawCalib(){
+  const b = imgBox(), dpr = window.devicePixelRatio || 1;
+  cc.width = Math.round(b.rw*dpr); cc.height = Math.round(b.rh*dpr); cctx.setTransform(dpr,0,0,dpr,0,0);
+  cctx.clearRect(0,0,b.rw,b.rh);
+  const P = cpts.map(p => [b.x + p[0]*b.s, b.y + p[1]*b.s]);
+  cctx.strokeStyle = "#3ee0c4"; cctx.lineWidth = 2; cctx.beginPath();
+  P.forEach((p,i) => i ? cctx.lineTo(p[0],p[1]) : cctx.moveTo(p[0],p[1])); if(P.length === 4) cctx.closePath(); cctx.stroke();
+  P.forEach((p,i) => { cctx.fillStyle = "#3ee0c4"; cctx.beginPath(); cctx.arc(p[0],p[1],6,0,7); cctx.fill();
+    cctx.fillStyle = "#04140f"; cctx.font = "800 10px sans-serif"; cctx.fillText(String(i+1), p[0]-3, p[1]+3.5); });
+  const steps = REF_STEPS[$("#calib-ref").value];
+  $("#calib-msg").textContent = cpts.length < 4 ? `Point ${cpts.length+1}/4: click the ${steps[cpts.length]}` :
+    "4 points set — Apply to update the homography.";
+  $("#calib-apply").disabled = cpts.length !== 4;
+}
+function endCalib(){ vp.classList.remove("calibrating"); cpts = []; }
+async function startFreshClickCalib(){
+  endDrag();
+  try{ const cal = await api("/api/calibration"); if(!cal.frame_size) throw new Error("No video frame yet");
+    frameSize = cal.frame_size; cpts = [];
+    await new Promise((res, rej) => { cimg.onload = res; cimg.onerror = () => rej(new Error("snapshot failed"));
+      cimg.src = "/api/snapshot?clean=1&t=" + Date.now(); });
+    vp.classList.add("calibrating"); drawCalib();
+  }catch(e){ toast(e.message, true); }
+}
+$("#btn-calib").addEventListener("click", () => { if(drag) $("#rv-confirm").click(); else startDrag(); });
+$("#rv-fresh").addEventListener("click", startFreshClickCalib);
+cc.addEventListener("click", ev => {
+  if(cpts.length >= 4) return;
+  const b = imgBox(), r = cc.getBoundingClientRect();
+  const x = (ev.clientX - r.left - b.x)/b.s, y = (ev.clientY - r.top - b.y)/b.s;
+  if(x < -frameSize[0]*0.05 || y < -frameSize[1]*0.05 || x > frameSize[0]*1.05 || y > frameSize[1]*1.05) return;
+  cpts.push([Math.round(x*10)/10, Math.round(y*10)/10]); drawCalib();
+});
+$("#calib-undo").addEventListener("click", () => { cpts.pop(); drawCalib(); });
+$("#calib-cancel").addEventListener("click", endCalib);
+$("#calib-ref").addEventListener("change", () => { if(vp.classList.contains("calibrating")){ cpts = []; drawCalib(); } });
+$("#calib-apply").addEventListener("click", async () => {
+  try{ await api("/api/calibration", {points:cpts, reference:$("#calib-ref").value}); toast("Homography updated"); endCalib(); }catch(e){}
+});
+/* ---------- review actions + 6-handle (TL, TR, BR, BL, NET-L, NET-R) drag editor ---------- */
+let drag = null;     // {court, img, labels, lines, idx, lastMoved}
+function drawDrag(){
+  const b = imgBox(), dpr = window.devicePixelRatio || 1;
+  cc.width = Math.round(b.rw*dpr); cc.height = Math.round(b.rh*dpr); cctx.setTransform(dpr,0,0,dpr,0,0);
+  cctx.clearRect(0,0,b.rw,b.rh);
+  const T = p => [b.x + p[0]*b.s, b.y + p[1]*b.s];
+  cctx.save(); cctx.beginPath(); cctx.rect(b.x, b.y, b.w, b.h); cctx.clip();
+  (drag.lines || []).forEach((ln,i) => { if(!ln || ln.length < 2) return;
+    cctx.strokeStyle = i === 4 ? "#ffffff" : (i < 4 ? "#5dff7a" : "#2fd3e0");
+    cctx.lineWidth = i === 4 ? 3 : 2.2; cctx.shadowColor = "#2fd3e0"; cctx.shadowBlur = 8; cctx.beginPath();
+    ln.forEach((p,j) => { const q = T(p); j ? cctx.lineTo(q[0],q[1]) : cctx.moveTo(q[0],q[1]); }); cctx.stroke(); });
+  cctx.restore(); cctx.shadowBlur = 0;
+  drag.img.forEach((p,i) => {
+    const q = T(p), lbl = (drag.labels && drag.labels[i]) || String(i+1), isNet = lbl.startsWith("NET");
+    const col = isNet ? "#ffffff" : "#e8ff3a";
+    cctx.fillStyle = "rgba(8,10,14,.85)"; cctx.beginPath(); cctx.arc(q[0],q[1],12,0,7); cctx.fill();
+    cctx.strokeStyle = col; cctx.lineWidth = 2.6; cctx.stroke();
+    cctx.font = "800 10.5px sans-serif";
+    const tw = cctx.measureText(lbl).width;
+    const lx = Math.min(Math.max(b.x + 4, q[0] + 15), b.x + b.w - tw - 10), ly = Math.min(Math.max(b.y + 18, q[1] + 4), b.y + b.h - 6);
+    cctx.fillStyle = "rgba(8,10,14,.85)"; cctx.fillRect(lx - 4, ly - 12, tw + 8, 16);
+    cctx.strokeStyle = col; cctx.lineWidth = 1; cctx.strokeRect(lx - 4, ly - 12, tw + 8, 16);
+    cctx.fillStyle = col; cctx.fillText(lbl, lx, ly);
+  });
+}
+async function startDrag(){
+  endCalib();
+  try{
+    const j = await api("/api/calibration/manual", {}); const rv = j.review;
+    if(!rv.handles) return startFreshClickCalib();
+    frameSize = rv.frame_size;
+    await new Promise((res, rej) => { cimg.onload = res; cimg.onerror = () => rej(new Error("snapshot failed"));
+      cimg.src = "/api/snapshot?clean=1&t=" + Date.now(); });
+    drag = {court: rv.handles.court_m, img: rv.handles.image_px, labels: rv.handles.labels || ["TL","TR","BR","BL","NET-L","NET-R"], lines: rv.lines_px, idx: null, lastMoved: null};
+    vp.classList.add("dragging"); drawDrag();
+  }catch(e){ toast(e.message, true); }
+}
+function endDrag(){ vp.classList.remove("dragging"); drag = null; }
+function evToImg(ev){ const b = imgBox(), r = cc.getBoundingClientRect();
+  return [(ev.clientX - r.left - b.x)/b.s, (ev.clientY - r.top - b.y)/b.s]; }
+let pushTimer = null;
+async function pushHandles(){
+  if(!drag) return;
+  try{ const j = await api("/api/calibration/handles", {court_m: drag.court, image_px: drag.img, dragged_idx: drag.lastMoved});
+    if(drag){ drag.lines = j.review.lines_px; if(j.review.handles){ drag.img = j.review.handles.image_px; drag.court = j.review.handles.court_m; } drawDrag(); } }catch(e){}
+}
+cc.addEventListener("pointerdown", ev => {
+  if(!drag) return; const [x,y] = evToImg(ev), b = imgBox();
+  let best = -1, bd = 1e9; drag.img.forEach((p,i) => { const d = Math.hypot((p[0]-x)*b.s, (p[1]-y)*b.s); if(d < bd){ bd = d; best = i; } });
+  if(bd < 28){ drag.idx = best; drag.lastMoved = best; cc.setPointerCapture(ev.pointerId); cc.style.cursor = "grabbing"; }
+});
+cc.addEventListener("pointermove", ev => {
+  if(!drag || drag.idx == null) return; const [x,y] = evToImg(ev);
+  drag.img[drag.idx] = [Math.round(x*10)/10, Math.round(y*10)/10]; drag.lastMoved = drag.idx; drawDrag();
+  if(!pushTimer) pushTimer = setTimeout(() => { pushTimer = null; pushHandles(); }, 65);
+});
+cc.addEventListener("pointerup", () => { if(drag && drag.idx != null){ drag.idx = null; cc.style.cursor = ""; pushHandles(); } });
+$("#rv-confirm").addEventListener("click", async () => {
+  try{ await api("/api/calibration/confirm", {}); endDrag(); toast("Court calibration locked"); }catch(e){} });
+$("#rv-adjust").addEventListener("click", startDrag);
+$("#rv-rerun").addEventListener("click", async () => { endDrag(); endCalib();
+  try{ const j = await api("/api/calibration/auto", {}); toast(`Court locked (confidence ${Math.round(j.info.confidence_pct || 0)}%)`); }catch(e){} });
+window.addEventListener("resize", () => { if(vp.classList.contains("calibrating")) drawCalib(); if(drag) drawDrag(); drawMap(lastTel); });
+document.addEventListener("keydown", ev => {
+  if(ev.key === "Escape"){ if(vp.classList.contains("calibrating")) endCalib(); if(drag) endDrag(); }
+  const rv = lastTel && lastTel.calibration_review; if(!rv || ["INPUT","SELECT","TEXTAREA"].includes(document.activeElement.tagName)) return;
+  const k = ev.key.toLowerCase();
+  if((ev.key === "Enter" || k === "y" || (k === "c" && drag)) && (rv.state === "review" || rv.state === "manual")) $("#rv-confirm").click();
+  else if((k === "m" || k === "c") && rv.state !== "detecting" && !drag) startDrag();
+  else if(k === "n" && (drag || rv.state === "manual" || vp.classList.contains("calibrating"))){
+    if(vp.classList.contains("calibrating")) startDrag(); else startFreshClickCalib();
+  }
+  else if(k === "a" && rv.state !== "detecting") $("#rv-rerun").click();
+});
+</script>
+</body>
+</html>

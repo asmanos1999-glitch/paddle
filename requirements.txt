@@ -1,0 +1,15 @@
+# PadelIQ - core vision engine
+numpy>=1.26
+opencv-python>=4.9
+scipy>=1.11
+ultralytics>=8.3          # YOLOv8 detection + pose (pulls in torch)
+openvino>=2024.0          # fast CPU pose backend (yolov8n-pose_openvino_model)
+
+# Enterprise web command center
+fastapi>=0.110
+uvicorn>=0.29
+psutil>=5.9               # optional: CPU / RAM in the health panel
+
+# Optional sources
+yt-dlp>=2024.1            # YouTube video / live URLs
+pygrabber>=0.2; sys_platform == "win32"   # webcam names -> picks the Logitech BRIO, skips IR sensors
