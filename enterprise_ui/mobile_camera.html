@@ -1,0 +1,389 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+<meta name="theme-color" content="#06090f">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<title>PadelIQ Mobile Camera</title>
+<style>
+:root{--bg:#06090f;--ink:#eef3f8;--mute:#9aa7b4;--line:rgba(255,255,255,.14);--accent:#3ddc84;--warn:#ffb020;--bad:#ff5d6c;
+  --glass:rgba(10,14,22,.72);--safe-t:env(safe-area-inset-top,0px);--safe-b:env(safe-area-inset-bottom,0px);
+  --safe-l:env(safe-area-inset-left,0px);--safe-r:env(safe-area-inset-right,0px)}
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+html,body{margin:0;height:100%;background:var(--bg);color:var(--ink);overflow:hidden;
+  font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;overscroll-behavior:none}
+#stage{position:fixed;inset:0}
+video,#hud{position:absolute;inset:0;width:100%;height:100%;object-fit:contain;background:#000}
+#hud{display:none;z-index:2}
+#ov{position:absolute;inset:0;width:100%;height:100%;touch-action:none;z-index:3}
+.bar{position:absolute;left:0;right:0;display:flex;align-items:center;gap:8px;padding:10px 12px;z-index:5;pointer-events:none}
+.bar>*{pointer-events:auto}
+.top{top:0;padding-top:calc(10px + var(--safe-t));padding-left:calc(12px + var(--safe-l));padding-right:calc(12px + var(--safe-r));
+  background:linear-gradient(rgba(0,0,0,.55),transparent)}
+.bottom{bottom:0;padding-bottom:calc(12px + var(--safe-b));padding-left:calc(12px + var(--safe-l));padding-right:calc(12px + var(--safe-r));
+  background:linear-gradient(transparent,rgba(0,0,0,.65));justify-content:center;flex-wrap:wrap}
+.chip{display:inline-flex;align-items:center;gap:6px;background:var(--glass);border:1px solid var(--line);border-radius:999px;
+  padding:6px 11px;font-size:12.5px;font-weight:600;white-space:nowrap;backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px)}
+.dot{width:8px;height:8px;border-radius:50%;background:var(--mute)}
+.ok .dot{background:var(--accent);box-shadow:0 0 8px var(--accent)}
+.chip.live{border-color:rgba(61,220,132,.6);background:rgba(8,40,22,.78);letter-spacing:.02em}
+.chip.live .dot{display:none} .warn .dot{background:var(--warn)} .bad .dot{background:var(--bad)}
+.spacer{flex:1}
+button{font:inherit;color:var(--ink);background:var(--glass);border:1px solid var(--line);border-radius:14px;padding:12px 16px;
+  font-size:15px;font-weight:700;min-height:48px;backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px);cursor:pointer}
+button:active{transform:scale(.97)}
+button[disabled]{opacity:.45}
+button.primary{background:var(--accent);color:#04210f;border-color:transparent}
+button.small{min-height:36px;padding:7px 12px;font-size:13px;border-radius:999px}
+#msg{position:absolute;left:50%;top:calc(64px + var(--safe-t));transform:translateX(-50%);z-index:6;max-width:min(92vw,560px);
+  text-align:center;font-size:13.5px;font-weight:600;background:var(--glass);border:1px solid var(--line);border-radius:12px;
+  padding:8px 14px;display:none;backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px)}
+#msg.err{border-color:var(--bad);color:#ffd2d7}
+#rotate{position:absolute;left:50%;bottom:calc(92px + var(--safe-b));transform:translateX(-50%);z-index:6;font-size:13px;
+  background:rgba(255,176,32,.16);border:1px solid var(--warn);color:#ffe2a8;border-radius:10px;padding:6px 12px;display:none;white-space:nowrap}
+#start{position:fixed;inset:0;z-index:10;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:16px;
+  padding:24px;text-align:center;background:radial-gradient(circle at 50% 30%,#123 0,#06090f 70%)}
+#start h1{margin:0;font-size:26px;letter-spacing:-.01em}
+#start p{margin:0;color:var(--mute);max-width:420px;line-height:1.45;font-size:15px}
+#start .big{font-size:18px;padding:16px 26px;border-radius:16px}
+.logo{width:56px;height:56px;border-radius:16px;background:var(--accent);color:#04210f;display:grid;place-items:center;font-weight:900;font-size:28px}
+#err{color:#ffc2c9;font-size:14px;max-width:440px;line-height:1.4}
+.sr{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0)}
+</style>
+</head>
+<body>
+<div id="stage">
+  <video id="video" playsinline muted autoplay></video>
+  <img id="hud" alt="PadelIQ analyzed HUD stream">
+  <canvas id="ov" aria-label="Court overlay - drag the four corner handles"></canvas>
+</div>
+
+<div class="bar top">
+  <span class="chip" id="c-link"><span class="dot"></span><span id="t-link">Offline</span></span>
+  <span class="chip" id="c-cal"><span class="dot"></span><span id="t-cal">Court: -</span></span>
+  <span class="chip" id="c-stats" style="display:none"><span id="t-stats"></span></span>
+  <span class="spacer"></span>
+  <button class="small" id="b-lens" style="display:none" aria-label="Switch lens (Rear Wide 1x / Ultra-Wide 0.5x)">Rear Wide 1x</button>
+  <button class="small" id="b-hud" style="display:none" aria-pressed="false">HUD</button>
+  <button class="small" id="b-fs" aria-label="Fullscreen">&#x26F6;</button>
+</div>
+<div id="msg" role="status" aria-live="polite"></div>
+<div id="rotate">Rotate the phone to landscape for full-court coverage</div>
+<div class="bar bottom">
+  <button id="b-auto">&#x1F3AF; Auto-Detect Court</button>
+  <button id="b-reset" style="display:none">Re-calibrate</button>
+  <button class="primary" id="b-lock" disabled>&#x1F512; Lock Court &amp; Start Analytics</button>
+</div>
+
+<div id="start">
+  <div class="logo">P</div>
+  <h1>PadelIQ Mobile Camera</h1>
+  <p>Your phone becomes the court camera. Mount it high behind the baseline, in landscape, so all four court corners are visible.</p>
+  <button class="primary big" id="b-start">Start Camera</button>
+  <div id="err"></div>
+</div>
+
+<script>
+"use strict";
+const $ = s => document.querySelector(s);
+const video = $("#video"), ov = $("#ov"), ctx = ov.getContext("2d"), hudImg = $("#hud");
+const TOKEN = new URLSearchParams(location.search).get("k") || "";
+const JPEG_Q = 0.72, TARGET_FPS = 30, MAX_IN_FLIGHT = 2, MAX_BUFFERED = 65536;
+let SEND_LONG_EDGE = 1280;            // adaptive: 1280 <-> 960 from the measured ack round-trip
+const rtts = [], sendT = [];
+const LABELS = ["TL", "TR", "BR", "BL"];
+const COURT = [[0,0],[10,0],[10,20],[0,20]];
+
+let stream = null, track = null, ws = null, wsBackoff = 500, inFlight = 0, sent = 0, sentTimes = [];
+let corners = null, calib = {}, dragIdx = -1, localEditUntil = 0, lastCornerSend = 0, edited = false;
+let lensOptions = [], lensIdx = 0, metaKey = "", hudOn = false, busy = {};
+const grab = document.createElement("canvas");
+const gctx = grab.getContext("2d", {alpha:false, desynchronized:true}) || grab.getContext("2d");
+
+/* ---------------- messages ---------------- */
+let msgTimer = 0;
+function say(text, isErr, ms){ const m = $("#msg"); m.textContent = text; m.className = isErr ? "err" : ""; m.style.display = "block";
+  clearTimeout(msgTimer); msgTimer = setTimeout(() => m.style.display = "none", ms || 3200); }
+function chip(id, cls, text){ const c = $(id); c.className = "chip " + (cls || ""); c.querySelector("span:last-child").textContent = text; }
+
+/* ---------------- camera ---------------- */
+async function openCamera(extra){
+  const base = {width:{ideal:1280}, height:{ideal:720}, frameRate:{ideal:30, max:30}};
+  const tries = extra ? [Object.assign({}, base, extra)] : [
+    Object.assign({facingMode:{exact:"environment"}}, base),
+    Object.assign({facingMode:{ideal:"environment"}}, base),
+    base];
+  let lastErr;
+  for(const v of tries){
+    try{ return await navigator.mediaDevices.getUserMedia({video:v, audio:false}); }catch(e){ lastErr = e;
+      if(e && (e.name === "NotAllowedError" || e.name === "SecurityError")) throw e; }
+  }
+  throw lastErr;
+}
+async function useStream(s){
+  if(stream) stream.getTracks().forEach(t => t.stop());
+  stream = s; track = s.getVideoTracks()[0]; video.srcObject = s;
+  try{ await video.play(); }catch(e){}
+  await new Promise(r => { if(video.videoWidth) r(); else video.onloadedmetadata = () => r(); });
+  sendMeta(true);
+}
+async function buildLenses(){
+  lensOptions = [];
+  let caps = {};
+  try{ caps = track.getCapabilities ? track.getCapabilities() : {}; }catch(e){}
+  const cur = track.getSettings ? track.getSettings() : {};
+  if(caps.zoom && caps.zoom.min <= 0.6){                       // Android logical multi-camera: 0.5x through zoom
+    lensOptions = [{label:"Rear Wide 1x", zoom:1}, {label:"Ultra-Wide 0.5x", zoom:caps.zoom.min}];
+  }else{
+    let devs = [];
+    try{ devs = (await navigator.mediaDevices.enumerateDevices()).filter(d => d.kind === "videoinput"); }catch(e){}
+    const back = devs.filter(d => !/front|user|facetime|selfie/i.test(d.label) && (/back|rear|environment|facing back|camera2 0/i.test(d.label) || devs.length <= 2));
+    const ultra = back.find(d => /ultra|0[.,]5|wide.?angle/i.test(d.label));
+    const main = back.find(d => d !== ultra && /^back camera$|back camera|camera2 0|rear/i.test(d.label) && !/tele|dual|triple/i.test(d.label))
+              || back.find(d => d !== ultra);
+    if(ultra && main) lensOptions = [{label:"Rear Wide 1x", deviceId:main.deviceId, name:main.label}, {label:"Ultra-Wide 0.5x", deviceId:ultra.deviceId, name:ultra.label}];
+    if(ultra && cur.deviceId === ultra.deviceId) lensIdx = 1;
+  }
+  $("#b-lens").style.display = lensOptions.length > 1 ? "" : "none";
+  $("#b-lens").textContent = "\u{1F4F7} " + (lensOptions.length ? lensOptions[lensIdx].label : "Rear Wide 1x");
+}
+async function switchLens(){
+  if(lensOptions.length < 2) return;
+  lensIdx = (lensIdx + 1) % lensOptions.length;
+  const o = lensOptions[lensIdx];
+  try{
+    if(o.zoom !== undefined){ await track.applyConstraints({advanced:[{zoom:o.zoom}]}); }
+    else{ await useStream(await openCamera({deviceId:{exact:o.deviceId}})); }
+    $("#b-lens").textContent = "\u{1F4F7} " + o.label; say(`Lens ${o.label}${o.name ? " - " + o.name : ""}`);
+    sendMeta(true);
+  }catch(e){ say("Lens switch failed: " + (e.message || e.name), true); }
+}
+
+/* ---------------- metadata ---------------- */
+function orientation(){
+  const t = (screen.orientation && screen.orientation.type) || (Math.abs(window.orientation || 0) === 90 ? "landscape" : "portrait");
+  return t.startsWith("landscape") ? "landscape" : "portrait";
+}
+function sendMeta(force){
+  if(!video.videoWidth) return;
+  const s = track && track.getSettings ? track.getSettings() : {};
+  const lens = lensOptions[lensIdx] ? lensOptions[lensIdx].label + (lensOptions[lensIdx].name ? " " + lensOptions[lensIdx].name : "") : (track ? track.label : "");
+  const m = {type:"meta", w:video.videoWidth, h:video.videoHeight, orientation:orientation(), lens:lens || "rear camera",
+             zoom:s.zoom || 1, facing:s.facingMode || "environment", fps:s.frameRate || null, track_w:s.width || null, track_h:s.height || null,
+             lenses:lensOptions.map(o => o.label), ua:navigator.userAgent.slice(0, 160)};
+  const key = [m.w, m.h, m.orientation, m.lens, m.zoom].join("|");
+  $("#rotate").style.display = m.h > m.w ? "block" : "none";
+  if(!force && key === metaKey) return;
+  metaKey = key;
+  if(ws && ws.readyState === 1) ws.send(JSON.stringify(m));
+}
+
+/* ---------------- frame streaming ---------------- */
+function scheduleFrame(){
+  if(video.requestVideoFrameCallback) video.requestVideoFrameCallback(() => pump());
+  else setTimeout(pump, 1000 / TARGET_FPS);
+}
+let lastSendT = 0;
+function pump(){
+  const now = performance.now();
+  // flow-control gate: at most 2 un-acked frames AND nothing waiting in the socket buffer -> no Wi-Fi backlog
+  if(ws && ws.readyState === 1 && inFlight < MAX_IN_FLIGHT && ws.bufferedAmount < MAX_BUFFERED && video.videoWidth &&
+     !document.hidden && now - lastSendT >= 1000 / TARGET_FPS - 4){
+    lastSendT = now;
+    const vw = video.videoWidth, vh = video.videoHeight, k = Math.min(1, SEND_LONG_EDGE / Math.max(vw, vh));
+    const w = Math.round(vw * k), h = Math.round(vh * k);
+    if(grab.width !== w || grab.height !== h){ grab.width = w; grab.height = h; }
+    gctx.drawImage(video, 0, 0, w, h);
+    inFlight++;
+    grab.toBlob(b => {
+      if(b && ws && ws.readyState === 1){ ws.send(b); sent++; const t = performance.now(); sendT.push(t);
+        sentTimes.push(t); if(sentTimes.length > 40) sentTimes.shift(); }
+      else inFlight = Math.max(0, inFlight - 1);
+    }, "image/jpeg", JPEG_Q);
+    sendMeta(false);
+  }
+  scheduleFrame();
+}
+function sendFps(){ const t = performance.now(), r = sentTimes.filter(x => t - x < 2000); return r.length > 1 ? (r.length - 1) / ((r[r.length-1] - r[0]) / 1000) : 0; }
+
+/* ---------------- websocket ---------------- */
+function connect(){
+  const proto = location.protocol === "https:" ? "wss:" : "ws:";
+  ws = new WebSocket(`${proto}//${location.host}/ws/mobile-cam?k=${encodeURIComponent(TOKEN)}`);
+  ws.binaryType = "arraybuffer";
+  chip("#c-link", "warn", "Connecting...");
+  ws.onopen = () => { wsBackoff = 500; inFlight = 0; sendT.length = 0; metaKey = ""; sendMeta(true); chip("#c-link", "ok", "Streaming"); };
+  ws.onmessage = ev => {
+    let m; try{ m = JSON.parse(ev.data); }catch(e){ return; }
+    if(m.type === "ack"){ inFlight = Math.max(0, inFlight - 1); const t0 = sendT.shift();
+      if(t0){ rtts.push(performance.now() - t0); if(rtts.length > 30) rtts.shift(); } }
+    else if(m.type === "calib") onCalib(m);
+    else if(m.type === "result") onResult(m);
+    else if(m.type === "error") { say(m.message, true, 8000); wsBackoff = 10000; }
+  };
+  ws.onclose = () => { chip("#c-link", "bad", "Reconnecting..."); inFlight = 0;
+    setTimeout(connect, wsBackoff); wsBackoff = Math.min(8000, wsBackoff * 1.6); };
+  ws.onerror = () => {};
+}
+let slowS = 0, fastS = 0;
+setInterval(() => {
+  if(ws && ws.readyState === 1){
+    const med = rtts.length ? rtts.slice().sort((a, b) => a - b)[rtts.length >> 1] : 0;
+    // weak Wi-Fi: drop to 960x540 after 2 s of slow acks, return to 1280x720 after 5 s of fast ones
+    if(med > 90 || sendFps() < 18){ slowS++; fastS = 0; } else if(med < 45){ fastS++; slowS = 0; }
+    if(slowS >= 2 && SEND_LONG_EDGE !== 960){ SEND_LONG_EDGE = 960; slowS = 0; }
+    if(fastS >= 5 && SEND_LONG_EDGE !== 1280){ SEND_LONG_EDGE = 1280; fastS = 0; }
+    chip("#c-link", "ok live", `\u{1F7E2} STREAMING LIVE TO STAGE | ${sendFps().toFixed(0)} FPS | ${Math.round(med)} ms`);
+    $("#c-link").title = SEND_LONG_EDGE === 960 ? "540p (weak Wi-Fi)" : "720p";
+    ws.send(JSON.stringify({type:"ping", t:Date.now()}));
+  }
+}, 1000);
+
+/* ---------------- calibration state ---------------- */
+const STATE_TXT = {idle:"Court: waiting", detecting:"Detecting court...", review:"Court found - review", manual:"Adjusting corners",
+                   confirmed:"Court LOCKED", failed:"Court not found"};
+function onCalib(m){
+  calib = m;
+  const conf = m.confidence_pct != null ? ` ${Math.round(m.confidence_pct)}%` : "";
+  const cls = m.state === "confirmed" ? "ok" : (m.state === "failed" ? "bad" : "warn");
+  chip("#c-cal", cls, (STATE_TXT[m.state] || ("Court: " + (m.state || "-"))) + (m.state === "confirmed" || m.state === "review" ? conf : ""));
+  if(m.state === "confirmed" || m.players != null){
+    const st = $("#c-stats"); st.style.display = "";
+    let t = `AI ${m.inference_fps != null ? m.inference_fps.toFixed(0) : "-"} fps | ${m.players != null ? m.players : 0} players`;
+    if(m.fiducial && m.fiducial.px_per_cm) t += ` | QR ${m.fiducial.px_per_cm.toFixed(1)} px/cm` + (m.fiducial.scale_agreement_pct != null ? ` (${Math.round(m.fiducial.scale_agreement_pct)}%)` : "");
+    $("#t-stats").textContent = t;
+  }
+  if(dragIdx < 0 && performance.now() > localEditUntil){ corners = m.corners ? m.corners.map(p => p.slice()) : corners; if(m.state !== "manual") edited = false; }
+  if(!m.corners && m.state === "detecting" && !edited) corners = null;
+  const locked = m.state === "confirmed";
+  const stageLocked = !!m.locked;
+  if(stageLocked && dragIdx >= 0){ dragIdx = -1; }
+  ov.style.pointerEvents = stageLocked ? "none" : "";
+  $("#b-lock").disabled = !corners || (locked && !edited);
+  $("#b-lock").innerHTML = locked && !edited ? "&#x2705; Analytics running" : "&#x1F512; Lock Court &amp; Start Analytics";
+  $("#b-reset").style.display = locked ? "" : "none";
+  $("#b-auto").style.display = locked ? "none" : "";
+  if(stageLocked){ $("#b-lock").disabled = true; $("#b-lock").innerHTML = "&#x1F512; Locked on stage ([L] to unlock)";
+    $("#b-reset").style.display = "none"; $("#b-auto").style.display = "none";
+    chip("#c-cal", "ok", "Court LOCKED (stage)" + conf); }
+  $("#b-hud").style.display = m.hud ? "" : "none";
+  if(!busy.auto) $("#b-auto").disabled = !m.source_active;
+}
+function onResult(m){
+  if(m.action === "auto_detect"){ busy.auto = false; $("#b-auto").disabled = false; $("#b-auto").innerHTML = "&#x1F3AF; Auto-Detect Court"; }
+  if(m.action === "lock"){ busy.lock = false; if(m.ok){ edited = false; localEditUntil = 0; } }
+  if(m.action === "corners" && !m.ok){ say(m.message, true); return; }
+  if(m.action !== "corners") say(m.message, !m.ok, m.ok ? 2600 : 5000);
+}
+$("#b-auto").addEventListener("click", () => {
+  if(!ws || ws.readyState !== 1) return say("Not connected yet", true);
+  busy.auto = true; edited = false; localEditUntil = 0;
+  $("#b-auto").disabled = true; $("#b-auto").textContent = "Detecting court...";
+  ws.send(JSON.stringify({type:"auto_detect"}));
+});
+$("#b-reset").addEventListener("click", () => { $("#b-auto").style.display = ""; $("#b-auto").click(); });
+$("#b-lock").addEventListener("click", () => {
+  if(!ws || ws.readyState !== 1 || !corners) return;
+  busy.lock = true;
+  ws.send(JSON.stringify(edited ? {type:"lock", pts:corners} : {type:"lock"}));
+});
+
+/* ---------------- AR court overlay ---------------- */
+function solveH(src, dst){ // 4-point DLT: src (court m) -> dst (normalised image)
+  const A = [], b = [];
+  for(let i = 0; i < 4; i++){ const [x, y] = src[i], [u, v] = dst[i];
+    A.push([x, y, 1, 0, 0, 0, -u*x, -u*y]); b.push(u);
+    A.push([0, 0, 0, x, y, 1, -v*x, -v*y]); b.push(v); }
+  for(let c = 0; c < 8; c++){ let p = c; for(let r = c+1; r < 8; r++) if(Math.abs(A[r][c]) > Math.abs(A[p][c])) p = r;
+    if(Math.abs(A[p][c]) < 1e-12) return null;
+    [A[c], A[p]] = [A[p], A[c]]; [b[c], b[p]] = [b[p], b[c]];
+    for(let r = 0; r < 8; r++){ if(r === c) continue; const f = A[r][c] / A[c][c]; if(!f) continue;
+      for(let k = c; k < 8; k++) A[r][k] -= f * A[c][k]; b[r] -= f * b[c]; } }
+  const h = b.map((v, i) => v / A[i][i]); h.push(1); return h;
+}
+function proj(h, x, y){ const w = h[6]*x + h[7]*y + h[8]; return [(h[0]*x + h[1]*y + h[2]) / w, (h[3]*x + h[4]*y + h[5]) / w]; }
+function box(){ // displayed video rect (object-fit: contain) in CSS px
+  const W = ov.clientWidth, H = ov.clientHeight, vw = video.videoWidth || 16, vh = video.videoHeight || 9;
+  const s = Math.min(W / vw, H / vh); return {x:(W - vw*s) / 2, y:(H - vh*s) / 2, w:vw*s, h:vh*s, W, H};
+}
+const toScreen = (b, p) => [b.x + p[0] * b.w, b.y + p[1] * b.h];
+function resize(){ const d = window.devicePixelRatio || 1; ov.width = Math.round(ov.clientWidth * d); ov.height = Math.round(ov.clientHeight * d); }
+window.addEventListener("resize", () => { resize(); sendMeta(false); });
+function draw(){
+  const d = window.devicePixelRatio || 1; ctx.setTransform(d, 0, 0, d, 0, 0); ctx.clearRect(0, 0, ov.clientWidth, ov.clientHeight);
+  if(corners && !hudOn){
+    const b = box(), h = solveH(COURT, corners);
+    if(h){
+      const line = (x1, y1, x2, y2, color, wdt, dash) => { const p = toScreen(b, proj(h, x1, y1)), q = toScreen(b, proj(h, x2, y2));
+        ctx.beginPath(); ctx.setLineDash(dash || []); ctx.strokeStyle = color; ctx.lineWidth = wdt; ctx.moveTo(p[0], p[1]); ctx.lineTo(q[0], q[1]); ctx.stroke(); };
+      const locked = calib.state === "confirmed" && !edited, main = locked ? "#3ddc84" : "#ffd23d";
+      ctx.beginPath(); COURT.forEach((c, i) => { const p = toScreen(b, proj(h, c[0], c[1])); i ? ctx.lineTo(p[0], p[1]) : ctx.moveTo(p[0], p[1]); });
+      ctx.closePath(); ctx.fillStyle = locked ? "rgba(61,220,132,.10)" : "rgba(255,210,61,.10)"; ctx.fill();
+      for(let x = 2.5; x < 10; x += 2.5) line(x, 0, x, 20, "rgba(255,255,255,.28)", 1, [4, 6]);
+      for(let y = 2; y < 20; y += 2) if(y !== 10) line(0, y, 10, y, "rgba(255,255,255,.22)", 1, [4, 6]);
+      line(0, 3.05, 10, 3.05, main, 2); line(0, 16.95, 10, 16.95, main, 2); line(5, 3.05, 5, 16.95, main, 2);
+      line(0, 10, 10, 10, "#38d6ff", 4);
+      for(let i = 0; i < 4; i++) line(COURT[i][0], COURT[i][1], COURT[(i+1)%4][0], COURT[(i+1)%4][1], main, 3.5);
+      const m = toScreen(b, proj(h, 5, 10));
+      ctx.setLineDash([]); ctx.font = "700 12px system-ui,sans-serif"; ctx.fillStyle = "#38d6ff"; ctx.textAlign = "center";
+      ctx.fillText("NET  10 m x 20 m", m[0], m[1] - 8);
+    }
+    corners.forEach((c, i) => {
+      let [x, y] = toScreen(b, c); const off = x < 0 || y < 0 || x > b.W || y > b.H;
+      x = Math.min(b.W - 22, Math.max(22, x)); y = Math.min(b.H - 22, Math.max(22, y));
+      ctx.setLineDash(off ? [3, 3] : []); ctx.beginPath(); ctx.arc(x, y, dragIdx === i ? 24 : 18, 0, Math.PI*2);
+      ctx.fillStyle = dragIdx === i ? "rgba(255,210,61,.55)" : "rgba(0,0,0,.45)"; ctx.fill();
+      ctx.lineWidth = 3; ctx.strokeStyle = off ? "#ff9f43" : "#fff"; ctx.stroke(); ctx.setLineDash([]);
+      ctx.fillStyle = "#fff"; ctx.font = "800 11px system-ui,sans-serif"; ctx.textAlign = "center"; ctx.textBaseline = "middle";
+      ctx.fillText(LABELS[i], x, y); ctx.textBaseline = "alphabetic";
+    });
+  }
+  requestAnimationFrame(draw);
+}
+function evPt(ev){ const r = ov.getBoundingClientRect(); return [ev.clientX - r.left, ev.clientY - r.top]; }
+ov.addEventListener("pointerdown", ev => {
+  if(!corners || hudOn) return; const b = box(), [px, py] = evPt(ev); let best = -1, bd = 52;
+  corners.forEach((c, i) => { let [x, y] = toScreen(b, c); x = Math.min(b.W - 22, Math.max(22, x)); y = Math.min(b.H - 22, Math.max(22, y));
+    const dd = Math.hypot(x - px, y - py); if(dd < bd){ bd = dd; best = i; } });
+  if(best >= 0){ dragIdx = best; ov.setPointerCapture(ev.pointerId); ev.preventDefault(); }
+});
+ov.addEventListener("pointermove", ev => {
+  if(dragIdx < 0) return; const b = box(), [px, py] = evPt(ev);
+  corners[dragIdx] = [(px - b.x) / b.w, (py - b.y) / b.h]; edited = true; localEditUntil = performance.now() + 1500;
+  $("#b-lock").disabled = false; $("#b-lock").innerHTML = "&#x1F512; Lock Court &amp; Start Analytics";
+  const t = performance.now(); if(t - lastCornerSend > 90 && ws && ws.readyState === 1){ lastCornerSend = t; ws.send(JSON.stringify({type:"corners", pts:corners})); }
+});
+const endDrag = () => { if(dragIdx < 0) return; dragIdx = -1; localEditUntil = performance.now() + 1500;
+  if(ws && ws.readyState === 1) ws.send(JSON.stringify({type:"corners", pts:corners})); };
+ov.addEventListener("pointerup", endDrag); ov.addEventListener("pointercancel", endDrag);
+
+/* ---------------- HUD view / fullscreen / wake lock ---------------- */
+$("#b-hud").addEventListener("click", () => { hudOn = !hudOn; $("#b-hud").setAttribute("aria-pressed", String(hudOn));
+  hudImg.style.display = hudOn ? "block" : "none"; hudImg.src = hudOn ? `/api/mobile/hud.mjpg?k=${encodeURIComponent(TOKEN)}&t=${Date.now()}` : ""; });
+$("#b-fs").addEventListener("click", goFullscreen);
+$("#b-lens").addEventListener("click", switchLens);
+function goFullscreen(){ const el = document.documentElement;
+  (el.requestFullscreen || el.webkitRequestFullscreen || (() => Promise.resolve())).call(el).catch(() => {});
+  try{ screen.orientation && screen.orientation.lock && screen.orientation.lock("landscape").catch(() => {}); }catch(e){} }
+let wakeLock = null;
+async function keepAwake(){ try{ if("wakeLock" in navigator) wakeLock = await navigator.wakeLock.request("screen"); }catch(e){} }
+document.addEventListener("visibilitychange", () => { if(!document.hidden) keepAwake(); });
+
+/* ---------------- start ---------------- */
+$("#b-start").addEventListener("click", async () => {
+  const err = $("#err"); err.textContent = "";
+  if(!window.isSecureContext || !navigator.mediaDevices || !navigator.mediaDevices.getUserMedia){
+    err.textContent = "Camera access needs HTTPS. Open the https:// link from the QR code (accept the local certificate warning)."; return; }
+  if(!TOKEN){ err.textContent = "Missing pairing token - scan the QR code on the PadelIQ screen again."; return; }
+  goFullscreen(); keepAwake();
+  try{ await useStream(await openCamera()); await buildLenses(); }
+  catch(e){ err.textContent = (e && e.name === "NotAllowedError") ? "Camera permission was denied. Allow camera access for this site and try again."
+      : "Could not open the rear camera: " + ((e && (e.message || e.name)) || e); return; }
+  $("#start").style.display = "none"; resize(); connect(); scheduleFrame(); requestAnimationFrame(draw);
+  say("Point the phone at the court, then tap Auto-Detect Court", false, 4500);
+});
+</script>
+</body>
+</html>

@@ -56,6 +56,7 @@ import cv2
 
 import padeliq_live_stream as E
 import court_geometry_ai as CG
+import padeliq_mobile_bridge as MB
 
 try:
     import psutil
@@ -68,8 +69,9 @@ import uvicorn
 
 APP_DIR = E.APP_DIR
 UI_DIR = os.path.join(APP_DIR, "enterprise_ui")
-VERSION = "1.3.0"
-IDLE_RENDER_FPS = 10.0      # refresh rate for banners / QR screen when no camera frames arrive
+VERSION = "1.5.0"
+IDLE_RENDER_FPS = 10.0      # refresh rate for banners when no camera frames arrive
+SWITCH_FIRST_FRAME_TIMEOUT_S = 20.0   # source swap: keep the current feed until the new one delivers (or give up)
 log = E.log
 
 
@@ -118,7 +120,17 @@ class PadelIQEngine:
         self.started_at = time.time()
         self.session_started_at = time.time()
 
-        self.detector = E.PersonDetector(args.model, imgsz=args.imgsz, conf=args.conf)
+        self.detector = E.PersonDetector(args.model, imgsz=args.imgsz, conf=args.conf, backend=args.ai_backend,
+                                         pose_stride=args.pose_stride, use_roi=not args.no_roi)
+        self.exposure_pref = args.exposure          # applied to every webcam this engine opens
+        self.calib_locked = False
+        self._stash = {}                            # per-source confirmed calibration (failover swaps)
+        self._spec_cache = {}
+        self._roi_key = None
+        self.epoch = 0
+        self.failover_primary = args.source
+        self.failover_on_alt = False
+        self._toast = ("", 0.0)
         self.cam = None
         self.spec = None
         self.source_state = "starting"         # starting | switching | ready | error
@@ -135,6 +147,12 @@ class PadelIQEngine:
         self.jpeg = b""
         self.jpeg_seq = 0
         self.jpeg_cond = threading.Condition()
+        self.frame_waiters = set()             # (event loop, asyncio.Event) per MJPEG viewer
+        # QR phone camera (HTTPS bridge on :8443 started in main(); routes also mounted on the dashboard app)
+        self.mobile = MB.MobileHub(https_port=args.mobile_port, lan_ip=args.lan_ip,
+                                   fiducial_size_cm=args.fiducial_size_cm)
+        self.mobile.controller = EngineMobileController(self)
+        self._waiting = (None, 0.0, "")         # cached QR waiting screen (img, built_at, detail)
         self.clean_canvas = None
         self.clean_lock = threading.Lock()
 
@@ -161,8 +179,11 @@ class PadelIQEngine:
         self.ball = E.PadelBallTracker()
         self.last_boxes = np.zeros((0, 4), np.float32)
         self.last_yolo_balls = np.zeros((0, 4), np.float32)
+        self.last_kps = []
+        self.last_det_ts = None
         self.ball_worker = E.BallWorker(lambda: self.cam, self.ball,
-                                        lambda: (self.last_boxes, self.last_yolo_balls), args.hud_min_height)
+                                        lambda: (self.last_boxes, self.last_yolo_balls, self.last_kps, self.last_det_ts),
+                                        args.hud_min_height)
 
         self.coach_feed = deque(maxlen=200)
         self._last_tip = {}
@@ -197,47 +218,178 @@ class PadelIQEngine:
         return run
 
     # ---------------------------------------------------------------- source
-    def set_source(self, source, esp32_ip=None, background=True):
+    def toast(self, msg, secs=2.5):
+        self._toast = (msg, time.time() + secs)
+        log(msg)
+
+    def toast_text(self):
+        msg, until = self._toast
+        return msg if msg and time.time() < until else ""
+
+    @staticmethod
+    def _src_key(spec):
+        return f"{spec.kind}:{spec.source}"
+
+    def _stash_calibration(self):
+        """Lock held: remember the confirmed calibration of the current source."""
+        if self.spec is not None and self.review.state == "confirmed" and self.corners is not None \
+                and self.canvas_shape is not None:
+            self._stash[self._src_key(self.spec)] = {
+                "corners": self.corners.copy(), "info": dict(self.review.info), "shape": self.canvas_shape,
+                "locked": self.calib_locked, "floor_mask": self.slot_mgr.floor_mask,
+                "floor_top_y": self.slot_mgr.floor_top_y, "calibration_info": dict(self.calibration_info)}
+
+    def _restore_calibration(self, spec):
+        """Lock held: restore the target source's calibration, or start a fresh one."""
+        self.ball.reset()
+        st = self._stash.get(self._src_key(spec))
+        if st:
+            self.canvas_shape = st["shape"]
+            self.corners = st["corners"].copy()
+            self.H = E.compute_homography(self.corners)
+            self.review.restore(self.corners, st["info"], st["shape"])
+            self.applied_version = self.review.version
+            self.slot_mgr.set_homography(self.H)
+            self.slot_mgr.floor_mask, self.slot_mgr.floor_top_y = st["floor_mask"], st["floor_top_y"]
+            self.ball.set_geometry(self.H, self.canvas_shape)
+            self.calibration_info = st["calibration_info"]
+            self.calib_locked = st["locked"]
+        else:
+            self.canvas_shape = None          # new source -> provisional geometry + fresh auto-calibration
+            self.corners = self.H = None
+            self.review.reset()
+            self.calibration_info = {}
+            self.calib_locked = False
+        self._roi_key = None
+        self._update_roi()
+
+    def set_source(self, source, esp32_ip=None, background=True, failover=False):
         def work():
             with self.switch_lock:
+                had_cam = self.cam is not None
                 self.source_state = "switching"
                 self.source_error = ""
                 try:
-                    spec = E.resolve_source(source, esp32_ip=esp32_ip, backend=self.args.backend)
+                    spec = self._spec_cache.get(source) if failover else None
+                    spec = spec or E.resolve_source(source, esp32_ip=esp32_ip, backend=self.args.backend)
                     if spec is None:
                         raise ValueError(f"unrecognised source {source!r}")
-                    new_cam = E.ThreadedLiveCamera(spec, stall_timeout=self.args.stall_timeout,
-                                                   cam_width=self.args.cam_width, cam_height=self.args.cam_height,
-                                                   cam_fps=self.args.cam_fps)
+                    if failover:
+                        self._spec_cache[source] = spec
+                    if spec.kind == "mobile":
+                        new_cam = self.mobile.create_camera(spec, stall_timeout=self.args.stall_timeout)
+                    else:
+                        new_cam = E.ThreadedLiveCamera(spec, stall_timeout=self.args.stall_timeout,
+                                                       cam_width=self.args.cam_width, cam_height=self.args.cam_height,
+                                                       cam_fps=self.args.cam_fps, exposure=self.exposure_pref,
+                                                       sport_exposure=self.args.sport_exposure)
                 except Exception as exc:
-                    self.source_state = "error"
+                    self.source_state = "ready" if had_cam else "error"
                     self.source_error = str(exc)
-                    log(f"Source switch failed: {exc}")
+                    self.toast(f"Source switch failed: {exc}", 4.0)
                     return
+                # Seamless swap: the current source keeps streaming until the new one delivers its first frame.
+                # (A phone that has not scanned the QR yet switches at once -> the QR pairing screen is shown.)
+                if had_cam and (spec.kind != "mobile" or self.mobile.connected):
+                    t_end = time.time() + SWITCH_FIRST_FRAME_TIMEOUT_S
+                    while self.running and new_cam.frame_id == 0 and time.time() < t_end:
+                        time.sleep(0.02)
+                    if new_cam.frame_id == 0:
+                        threading.Thread(target=new_cam.release, daemon=True).start()
+                        self.source_state = "ready"
+                        self.source_error = f"{spec.label}: no frames within {SWITCH_FIRST_FRAME_TIMEOUT_S:.0f} s"
+                        self.toast(f"Switch cancelled - {self.source_error}", 4.0)
+                        return
                 with self.lock:
                     old = self.cam
+                    self._stash_calibration()
                     self.cam, self.spec = new_cam, spec
-                    self.canvas_shape = None          # new source -> provisional geometry + fresh auto-calibration
-                    self.corners = self.H = None
-                    with self.review.lock:
-                        self.review.generation += 1
-                        self.review.state, self.review.corners, self.review.info = "idle", None, {}
-                        self.review.handles_img = self.review.handles_court = None
+                    self.epoch += 1
+                    self._restore_calibration(spec)
                     self.scene_cut.reset()
                     self.calib_frames.clear()
                     self.slot_mgr.reset_players()
+                    self.last_boxes, self.last_yolo_balls, self.last_kps = (np.zeros((0, 4), np.float32),
+                                                                            np.zeros((0, 4), np.float32), [])
                     self.session_started_at = time.time()
                     self.coach_feed.clear()
-                with self.clean_lock:
-                    self.clean_canvas = None
+                    if failover:
+                        self.failover_on_alt = not self.failover_on_alt
+                    else:
+                        self.failover_primary, self.failover_on_alt = source, False
                 self.source_state = "ready"
-                log(f"Source active: {spec.label}")
+                self.toast(f"Source active: {spec.label}")
                 if old is not None:
                     threading.Thread(target=old.release, daemon=True).start()
         if background:
             threading.Thread(target=work, daemon=True).start()
         else:
             work()
+
+    def failover(self):
+        """[F12] live camera <-> clean replay (or --failover-source); the current view stays live until ready."""
+        if self.source_state == "switching":
+            raise ValueError("a source switch is already in progress")
+        if self.failover_on_alt:
+            target = self.failover_primary
+        else:
+            kind = self.spec.kind if self.spec else "file"
+            target = self.args.failover_source or ("sim" if kind != "file" else "webcam")
+        self.toast(f"Failover -> {target} (current view stays live until it is ready)", 3.0)
+        self.set_source(target, failover=True)
+        return target
+
+    def set_exposure(self, mode):
+        cam = self.cam
+        if mode == "toggle":
+            cur = cam.exposure_mode if cam is not None else self.exposure_pref
+            mode = "sport" if cur == "auto" else "auto"
+        if mode not in E.EXPOSURE_MODES:
+            raise ValueError("mode must be auto | sport | toggle")
+        self.exposure_pref = mode
+        if cam is not None:
+            cam.set_exposure_mode(mode)
+        applies = cam is not None and cam.kind == "webcam"
+        self.toast(f"Camera: {E.EXPOSURE_LABELS[mode]}" + ("" if applies else " (applies to USB webcams)"))
+        return {"mode": mode, "label": E.EXPOSURE_LABELS[mode], "applies_to_current_source": applies}
+
+    def open_camera_settings(self):
+        cam = self.cam
+        if cam is None or cam.kind != "webcam":
+            raise ValueError("the current source is not a USB webcam")
+        cam.open_driver_settings()
+        return True
+
+    def set_lock(self, locked):
+        with self.lock:
+            if locked == "toggle":
+                locked = not self.calib_locked
+            locked = bool(locked)
+            if locked:
+                self._sync_review()
+                if self.review.state in ("review", "manual") and self.review.confirm("operator (lock)"):
+                    self._save_confirmed()
+                if self.review.state != "confirmed":
+                    raise ValueError("confirm the court calibration before locking it")
+            self.calib_locked = locked
+        self.toast("Calibration Locked" if locked else "Calibration Unlocked")
+        return locked
+
+    def _check_unlocked(self):
+        if self.calib_locked:
+            raise ValueError("calibration is locked - unlock it first")
+
+    def _update_roi(self):
+        """Lock held: court-ROI guided inference once the calibration is confirmed."""
+        rv = self.review
+        key = (rv.state == "confirmed", rv.version, self.canvas_shape, self.applied_version)
+        if key == self._roi_key:
+            return
+        self._roi_key = key
+        roi = None
+        if key[0] and self.corners is not None and self.canvas_shape is not None:
+            roi = CG.PoseCourtDetector.court_roi(self.corners, self.canvas_shape)
+        self.detector.set_roi(roi)
 
     # ----------------------------------------------------------- calibration
     def _ensure_geometry(self, canvas):
@@ -312,6 +464,7 @@ class PadelIQEngine:
                 self.ball.set_geometry(H, self.canvas_shape)
                 self.calibration_info = dict(rv.info)
             self.applied_version = rv.version
+        self._update_roi()
 
     def _save_confirmed(self):
         if self.corners is None or self.canvas_shape is None:
@@ -332,6 +485,7 @@ class PadelIQEngine:
         return self.review.status()
 
     def manual_calibration(self):
+        self._check_unlocked()
         with self.lock:
             if self.canvas_shape is None:
                 raise ValueError("no video frame yet")
@@ -340,6 +494,7 @@ class PadelIQEngine:
         return self.review_payload()
 
     def set_handles(self, court_m, image_px, dragged_idx=None):
+        self._check_unlocked()
         self.review.set_from_handles(court_m, image_px, dragged_idx=dragged_idx)
         with self.lock:
             self._sync_review()
@@ -365,6 +520,7 @@ class PadelIQEngine:
             self._save_confirmed()
 
     def calibrate_from_points(self, points, reference):
+        self._check_unlocked()
         if reference not in E.CALIBRATION_REFERENCES:
             raise ValueError(f"reference must be one of {list(E.CALIBRATION_REFERENCES)}")
         pts = np.asarray(points, dtype=np.float64)
@@ -378,6 +534,7 @@ class PadelIQEngine:
         return corners
 
     def auto_calibrate(self, wait_s=30.0):
+        self._check_unlocked()
         """(Re-)run AI court recognition; returns once the result is in review (or failed)."""
         if self.spec is None or self.canvas_shape is None:
             raise ValueError("no active source / frame yet")
@@ -424,7 +581,7 @@ class PadelIQEngine:
                         self._sync_review()
                         time.sleep(0.035)
                         continue
-                    elif self.review.state in ("review", "confirmed", "failed"):
+                    elif self.review.state in ("review", "confirmed", "failed") and not self.calib_locked:
                         cut, metrics = self.scene_cut.update(canvas, now=ts)
                         if cut:
                             log(f"Scene cut detected (HSV diff={metrics.get('hist_diff')}, SSIM={metrics.get('ssim')}) "
@@ -435,12 +592,15 @@ class PadelIQEngine:
                             self.ball.reset()
                             self._start_review(seed_frame=canvas)
                     self._sync_review()
+                    epoch = self.epoch
                 t0 = time.perf_counter()
                 boxes = self.detector(canvas)
-                self.last_boxes, self.last_yolo_balls = boxes, self.detector.last_balls
+                if epoch == self.epoch:
+                    self.last_boxes, self.last_yolo_balls = boxes, self.detector.last_balls
+                    self.last_kps, self.last_det_ts = self.detector.last_keypoints, ts
                 self.infer_latency_ms = 0.8 * self.infer_latency_ms + 0.2 * (time.perf_counter() - t0) * 1000
                 with self.lock:
-                    if cam is self.cam:
+                    if cam is self.cam and epoch == self.epoch:
                         self.slot_mgr.update_detections(
                             boxes, now=ts, keypoints=self.detector.last_keypoints, frame_shape=canvas.shape
                         )
@@ -449,6 +609,10 @@ class PadelIQEngine:
             except Exception as exc:
                 self._record_error("inference", exc)
                 time.sleep(0.05)
+
+    @property
+    def _jpeg_params(self):
+        return [int(cv2.IMWRITE_JPEG_QUALITY), int(self.args.jpeg_quality), int(cv2.IMWRITE_JPEG_OPTIMIZE), 0]
 
     def _render_loop(self):
         """Event-driven: blocks on the camera's latest-frame slot and renders the moment a frame lands, so
@@ -461,7 +625,7 @@ class PadelIQEngine:
             try:
                 cam = self.cam
                 if cam is not last_cam:
-                    last_cam, last_fid, last_canvas = cam, -1, None
+                    last_cam, last_fid = cam, -1          # keep showing the last frame until the new source's first
                 new = False
                 if cam is not None:
                     frame, fid, ts = E.cam_wait_latest(cam, last_fid, idle_dt)
@@ -484,14 +648,16 @@ class PadelIQEngine:
                 last_render = t0
                 if new:
                     self.frame_age_ms.append((time.time() - last_ts) * 1000.0)
+                if isinstance(cam, MB.MobileCamera) and cam.waiting_for_phone:
+                    self._render_waiting(cam)
+                    self.render_ms = 0.8 * self.render_ms + 0.2 * (time.perf_counter() - t0) * 1000
+                    continue
                 if last_canvas is not None:
                     hud = last_canvas.copy()
                 else:
                     hud = E.placeholder_frame()
-                degraded = cam is None or cam.is_degraded or self.source_state == "switching"
-                if self.source_state == "switching":
-                    detail = "Switching source ..."
-                elif cam is None:
+                degraded = cam is None or cam.is_degraded
+                if cam is None:
                     detail = "Starting ..."
                 elif cam.frame_id == 0:
                     detail = f"Connecting to {self.spec.label if self.spec else ''} {cam.last_error}".strip()
@@ -506,13 +672,21 @@ class PadelIQEngine:
                                       source_label=self.spec.label if self.spec else "starting",
                                       reconnecting=degraded, reconnect_detail=detail, hud_mode=self.hud_mode,
                                       ball=self.ball if have_geo else None,
-                                      review=self.review if have_geo else None, web=True)
-                ok, buf = cv2.imencode(".jpg", hud, [int(cv2.IMWRITE_JPEG_QUALITY), int(self.args.jpeg_quality)])
+                                      review=self.review if have_geo else None, web=True,
+                                      held=last_canvas is not None, locked=self.calib_locked,
+                                      toast=self.toast_text())
+                # Encoded once per render tick; every MJPEG viewer / projector tab shares these bytes.
+                ok, buf = cv2.imencode(".jpg", hud, self._jpeg_params)
                 if ok:
                     with self.jpeg_cond:
                         self.jpeg = buf.tobytes()
                         self.jpeg_seq += 1
                         self.jpeg_cond.notify_all()
+                    for loop, ev in list(self.frame_waiters):      # wake async MJPEG viewers (no polling)
+                        try:
+                            loop.call_soon_threadsafe(ev.set)
+                        except RuntimeError:
+                            self.frame_waiters.discard((loop, ev))
                     self.frames_rendered += 1
                     self.render_meter.tick()
                     if new:
@@ -521,6 +695,36 @@ class PadelIQEngine:
             except Exception as exc:
                 self._record_error("render", exc)
                 time.sleep(0.05)
+
+    def _publish_jpeg(self, img):
+        ok, buf = cv2.imencode(".jpg", img, self._jpeg_params)
+        if not ok:
+            return False
+        with self.jpeg_cond:
+            self.jpeg = buf.tobytes()
+            self.jpeg_seq += 1
+            self.jpeg_cond.notify_all()
+        for loop, ev in list(self.frame_waiters):
+            try:
+                loop.call_soon_threadsafe(ev.set)
+            except RuntimeError:
+                self.frame_waiters.discard((loop, ev))
+        return True
+
+    def _render_waiting(self, cam):
+        """Big scannable QR inside the live feed until the phone streams (rebuilt at 2 Hz, PIL text)."""
+        detail = MB.waiting_detail(cam, self.mobile)
+        img, built, last_detail = self._waiting
+        now = time.time()
+        if img is None or detail != last_detail or now - built > 0.5:
+            img = MB.render_waiting_screen(self.mobile, (1280, 720), detail)
+            toast = self.toast_text()
+            if toast:
+                E.draw_toast(img, img.shape[0] / 720.0, toast)
+            self._waiting = (img, now, detail)
+            if self._publish_jpeg(img):
+                self.frames_rendered += 1
+                self.render_meter.tick()
 
     def _telemetry_loop(self):
         proc = _safe(lambda: psutil.Process(os.getpid())) if psutil else None
@@ -606,6 +810,13 @@ class PadelIQEngine:
                        "seconds_since_frame": None if not cam or cam.frame_id == 0 else round(cam.seconds_since_frame, 2),
                        "reconnects": cam.reconnect_count if cam else 0,
                        "native_fps": round(cam.native_fps, 2) if cam else 0},
+            "mobile": self.mobile.status(include_token=False),
+            "camera": {"exposure": dict(cam.exposure_info) if cam is not None and cam.kind == "webcam"
+                       else {"mode": self.exposure_pref, "label": E.EXPOSURE_LABELS[self.exposure_pref]},
+                       "is_webcam": bool(cam is not None and cam.kind == "webcam")},
+            "failover": {"on_alternate": self.failover_on_alt, "primary": E._redact_url(str(self.failover_primary)),
+                         "alternate": self.args.failover_source or "sim / webcam"},
+            "ai": self.detector.backend_info,
             "pipeline": {"capture_fps": round(self.capture_meter.rate, 1),
                          "inference_fps": round(self.infer_meter.rate, 1),
                          "render_fps": round(self.render_meter.rate, 1),
@@ -615,7 +826,7 @@ class PadelIQEngine:
                          "frames_inferred": self.frames_inferred, "frames_rendered": self.frames_rendered,
                          "model": os.path.basename(self.args.model), "detector_ready": self.detector.model is not None,
                          "ball_tracker_fps": round(self.ball_worker.rate, 1)},
-            "calibration": {"calibrated": self.review.state == "confirmed",
+            "calibration": {"calibrated": self.review.state == "confirmed", "locked": self.calib_locked,
                             "review_state": self.review.state,
                             "confidence_pct": self.review.info.get("confidence_pct"),
                             "method": self.review.info.get("method") or self.calibration_info.get("method"),
@@ -657,6 +868,75 @@ class PadelIQEngine:
         self.ball_worker.stop()
         if self.cam:
             self.cam.release()
+
+
+class EngineMobileController(MB.MobileController):
+    """Phone -> engine: auto-detect, live corner drag, lock (all respect the stage calibration lock) and
+    auto-switch to the phone camera the moment a scanned phone streams its first frame."""
+
+    def __init__(self, engine):
+        self.e = engine
+
+    def _mobile_active(self):
+        return self.e.spec is not None and self.e.spec.kind == "mobile" and self.e.source_state == "ready"
+
+    def calibration_snapshot(self):
+        e = self.e
+        if not self._mobile_active():
+            return {"state": "idle" if e.source_state != "switching" else "detecting", "corners": None,
+                    "frame_shape": None, "locked": e.calib_locked}
+        rv, now = e.review, time.time()
+        st = rv.status()
+        with rv.lock:
+            corners = None if rv.corners is None else rv.corners.copy()
+            version = rv.version
+        with e.lock:
+            players = sum(1 for p in e.slot_mgr.players.values() if p.is_active(now))
+            shape = e.canvas_shape
+        return dict(st, corners=corners, frame_shape=shape, version=version, players=players,
+                    inference_fps=round(e.infer_meter.rate, 1), locked=e.calib_locked)
+
+    def auto_detect(self):
+        if not self._mobile_active():
+            raise ValueError("the phone camera is not the active source yet")
+        _, info = self.e.auto_calibrate()
+        return (f"Court detected: {info.get('confidence_pct') or 0:.0f}% ({info.get('angle') or 'Baseline'}) "
+                f"- drag corners to fine-tune, then Lock")
+
+    def preview_corners(self, corners_px):
+        e = self.e
+        e._check_unlocked()
+        with e.lock:
+            if e.canvas_shape is None:
+                raise ValueError("no phone frame yet")
+            if E.compute_homography(corners_px) is None:
+                raise ValueError("corners must form a convex court in order TL, TR, BR, BL")
+            e.review.frame_shape = tuple(e.canvas_shape)
+            e.review.set_manual_corners(corners_px, dict(e.review.info, method="phone_touch"))
+            e._sync_review()
+
+    def lock(self, corners_px=None):
+        e = self.e
+        if corners_px is not None:
+            e._check_unlocked()
+            e.apply_calibration(corners_px, dict(e.review.info, method="phone_touch",
+                                                 phone_corners_px=np.round(corners_px, 1).tolist()))
+        elif e.review.state != "confirmed":
+            e.confirm_calibration("operator (phone)")
+        if not e.calib_locked:
+            e.set_lock(True)
+        return "Court locked - live analytics started"
+
+    def on_phone_connected(self, meta):
+        e = self.e
+        if e.args.no_mobile_autoswitch or (e.spec is not None and e.spec.kind == "mobile"):
+            return
+        log("Phone paired via QR -> switching the live source to the phone camera")
+        e.set_source("mobile", background=True)   # never block the phone's WebSocket loop
+
+    def hud_jpeg(self):
+        e = self.e
+        return e.jpeg if (e.running and e.jpeg and self._mobile_active()) else None
 
 
 def court_lines_px(corners, frame_shape=(720, 1280)):
@@ -807,6 +1087,9 @@ def create_app(engine):
             return HTMLResponse("<h1>enterprise_ui/index.html missing</h1>", status_code=500)
         return FileResponse(path, media_type="text/html", headers={"Cache-Control": "no-cache"})
 
+    # phone portal on the dashboard port too: /mobile-camera, /ws/mobile-cam, /api/qr.png, /api/mobile/status
+    app.include_router(MB.build_mobile_router(engine.mobile, admin_local_only=False))
+
     @app.get("/video.mjpg")
     async def video():
         """Latest-frame-only MJPEG: an async generator on the event loop (no thread hop per frame). A slow viewer
@@ -816,16 +1099,24 @@ def create_app(engine):
         async def gen():
             engine.mjpeg_clients += 1
             seq = -1
+            waiter = (asyncio.get_running_loop(), asyncio.Event())
+            engine.frame_waiters.add(waiter)
             try:
                 while engine.running:
                     seq2, jpg = engine.jpeg_seq, engine.jpeg
                     if not jpg or seq2 == seq:
-                        await asyncio.sleep(0.002)
+                        waiter[1].clear()
+                        if engine.jpeg_seq == seq:
+                            try:
+                                await asyncio.wait_for(waiter[1].wait(), 1.0)
+                            except asyncio.TimeoutError:
+                                pass
                         continue
                     seq = seq2
                     yield (b"--" + boundary.encode() + b"\r\nContent-Type: image/jpeg\r\nContent-Length: "
                            + str(len(jpg)).encode() + b"\r\n\r\n" + jpg + b"\r\n")
             finally:
+                engine.frame_waiters.discard(waiter)
                 engine.mjpeg_clients = max(0, engine.mjpeg_clients - 1)
 
         return StreamingResponse(gen(), media_type=f"multipart/x-mixed-replace; boundary={boundary}",
@@ -904,6 +1195,43 @@ def create_app(engine):
         except Exception as exc:
             return err(str(exc))
 
+    @app.post("/api/calibration/lock")
+    async def calibration_lock(request: Request):
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        try:
+            return {"ok": True, "locked": engine.set_lock(body.get("locked", "toggle"))}
+        except Exception as exc:
+            return err(str(exc))
+
+    @app.post("/api/camera/exposure")
+    async def camera_exposure(request: Request):
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        try:
+            return {"ok": True, **engine.set_exposure(str(body.get("mode", "toggle")))}
+        except Exception as exc:
+            return err(str(exc))
+
+    @app.post("/api/camera/settings")
+    def camera_settings():
+        try:
+            engine.open_camera_settings()
+            return {"ok": True, "note": "driver dialog opened on the server machine (Power Line Frequency 50 Hz)"}
+        except Exception as exc:
+            return err(str(exc))
+
+    @app.post("/api/failover")
+    def failover():
+        try:
+            return {"ok": True, "switching_to": E._redact_url(engine.failover())}
+        except Exception as exc:
+            return err(str(exc))
+
     @app.post("/api/source")
     async def post_source(request: Request):
         try:
@@ -930,16 +1258,21 @@ def create_app(engine):
             if not E.is_youtube_url(val):
                 return err("not a YouTube URL")
             source = val
+        elif typ in ("mobile", "phone", "qr"):
+            source = "mobile"
         elif typ == "auto":
             source = "auto"
         elif typ == "url":
             source = val
         else:
-            return err("type must be sim|webcam|esp32|rtsp|youtube|auto|url")
+            return err("type must be sim|webcam|mobile|esp32|rtsp|youtube|auto|url")
         if typ in ("esp32", "rtsp", "youtube", "url") and E.resolve_source(source) is None:
             return err(f"unusable source: {source}")
         engine.set_source(source, esp32_ip=val if typ == "auto" and val else None)
-        return {"ok": True, "switching_to": E._redact_url(source)}
+        out = {"ok": True, "switching_to": E._redact_url(source)}
+        if source == "mobile":
+            out["mobile"] = engine.mobile.status(include_token=True)
+        return out
 
     @app.post("/api/reset")
     def reset():
@@ -1005,18 +1338,35 @@ def main(argv=None):
     ap.add_argument("--host", default="127.0.0.1", help="use 0.0.0.0 to serve the LAN")
     ap.add_argument("--port", type=int, default=8000)
     ap.add_argument("--source", default="sim",
-                    help="sim (clean match replay, default) | webcam (best camera, BRIO preferred) | auto | 0 | ESP32 IP | rtsp://... | YouTube URL | file")
+                    help="sim (clean match replay, default) | webcam (best camera, BRIO preferred) | mobile (QR phone camera) | auto | 0 | ESP32 IP | rtsp://... | YouTube URL | file")
     ap.add_argument("--model", default="yolov8n.pt")
     ap.add_argument("--imgsz", type=int, default=E.DEFAULT_IMGSZ, help="YOLO input size (512 default; 640 = slower)")
     ap.add_argument("--conf", type=float, default=0.30)
     ap.add_argument("--backend", default="auto", choices=["auto", "dshow", "msmf", "any"])
     ap.add_argument("--render-fps", type=float, default=60.0,
                     help="max annotated stream FPS; the stream follows the camera's native rate up to this cap")
-    ap.add_argument("--jpeg-quality", type=int, default=78)
+    ap.add_argument("--jpeg-quality", type=int, default=80, help="MJPEG quality (encoded once per frame, shared by all viewers)")
     ap.add_argument("--cam-width", type=int, default=None, help="webcam width (default 1280, MJPG)")
     ap.add_argument("--cam-height", type=int, default=None, help="webcam height (default 720, MJPG)")
     ap.add_argument("--cam-fps", type=int, default=None, help="webcam FPS request (default 60; driver clamps)")
     ap.add_argument("--hud", default="compact", choices=["compact", "full"])
+    ap.add_argument("--ai-backend", default="auto", choices=["auto", "openvino", "pytorch"],
+                    help="auto = OpenVINO detection + pose with PyTorch fallback")
+    ap.add_argument("--pose-stride", type=int, default=2, help="fresh pose every N AI ticks per player (1 = every tick)")
+    ap.add_argument("--no-roi", action="store_true", help="always run detection on the full frame")
+    ap.add_argument("--exposure", default="auto", choices=list(E.EXPOSURE_MODES),
+                    help="webcam exposure at start: auto | sport (fast shutter, max FPS)")
+    ap.add_argument("--sport-exposure", type=float, default=E.SPORT_EXPOSURE,
+                    help="sport-shutter exposure value (DirectShow log2 s: -5 = 1/32 s)")
+    ap.add_argument("--mobile-port", type=int, default=MB.MOBILE_HTTPS_PORT,
+                    help="HTTPS port of the QR phone-camera portal (self-signed certs/ generated on first run)")
+    ap.add_argument("--lan-ip", default=None, help="LAN IP encoded in the QR code (auto-detected by default)")
+    ap.add_argument("--no-https", action="store_true", help="do not start the HTTPS phone portal")
+    ap.add_argument("--no-mobile-autoswitch", action="store_true",
+                    help="do not switch to the phone camera automatically when a phone starts streaming")
+    ap.add_argument("--fiducial-size-cm", type=float, default=MB.DEFAULT_FIDUCIAL_SIZE_CM, help=argparse.SUPPRESS)
+    ap.add_argument("--failover-source", default=None,
+                    help="F12 / Failover target (default: sim replay when live, best webcam when replaying)")
     ap.add_argument("--hud-min-height", type=int, default=720)
     ap.add_argument("--stall-timeout", type=float, default=E.STALL_TIMEOUT_S)
     ap.add_argument("--open-browser", action="store_true")
@@ -1029,6 +1379,10 @@ def main(argv=None):
     E.tune_runtime_threads()          # GIL switch interval 2 ms + torch threads = cores - 2
 
     engine = PadelIQEngine(args)
+    if args.no_https:
+        engine.mobile.https_error = "disabled with --no-https"
+    else:                                             # phone portal: https://<LAN_IP>:8443/mobile-camera
+        MB.start_https_server(MB.build_https_app(engine.mobile), engine.mobile, os.path.join(APP_DIR, "certs"))
     engine.set_source(args.source, background=True)
     app = create_app(engine)
     url = f"http://{'localhost' if args.host in ('0.0.0.0', '127.0.0.1') else args.host}:{args.port}"

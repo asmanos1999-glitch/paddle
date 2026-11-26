@@ -91,6 +91,9 @@ button,input,select{font:inherit;color:inherit}
 .viewport.dragging .calib-bar{display:none}
 .toolbar{display:flex;gap:8px;flex-wrap:wrap;padding:12px 14px 14px;align-items:center}
 .toolbar .sep{width:1px;height:22px;background:var(--line-hi);margin:0 2px}
+.toolbar.stage{padding-top:0}
+.toolbar .stage-l{font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:var(--mute);margin-right:2px}
+.btn[aria-pressed="true"]{border-color:var(--accent,#2bd49a);color:var(--accent,#2bd49a)}
 select{background:var(--bg2);border:1px solid var(--line-hi);border-radius:8px;padding:6px 8px;font-size:12.5px}
 
 /* ---------- segmented ---------- */
@@ -120,6 +123,25 @@ select{background:var(--bg2);border:1px solid var(--line-hi);border-radius:8px;p
 .bar>i{display:block;height:100%;width:0;border-radius:99px;background:var(--pc);transition:width .4s ease}
 .barlbl{display:flex;justify-content:space-between;font-size:12px;color:var(--mute);margin-top:8px}
 .barlbl b{color:var(--ink);font-family:var(--mono);font-weight:600}
+
+/* ---------- mobile QR portal ---------- */
+.btn.qr{display:flex;align-items:center;justify-content:center;gap:8px;width:100%;margin-bottom:10px;padding:10px 12px;font-size:13.5px;
+  background:linear-gradient(180deg,rgba(91,140,255,.28),rgba(62,224,196,.20));border-color:rgba(91,140,255,.55)}
+.btn.qr .live{width:8px;height:8px;border-radius:50%;background:var(--dim)}
+.btn.qr.on .live{background:var(--ok);box-shadow:0 0 8px var(--ok)}
+#qr-modal{border:1px solid var(--line-hi);border-radius:16px;background:var(--bg2);color:var(--ink);padding:0;width:min(440px,calc(100vw - 32px));
+  box-shadow:0 30px 80px rgba(0,0,0,.6)}
+#qr-modal::backdrop{background:rgba(3,5,8,.72);backdrop-filter:blur(4px)}
+.qr-in{padding:18px 20px 20px;display:flex;flex-direction:column;gap:12px}
+.qr-hd{display:flex;align-items:center;justify-content:space-between;gap:10px}
+.qr-hd h3{margin:0;font-size:16px}
+.qr-img{display:block;width:100%;max-width:320px;aspect-ratio:1;margin:0 auto;border-radius:12px;background:#fff;image-rendering:pixelated}
+.qr-url{font-family:var(--mono);font-size:12px;word-break:break-all;background:rgba(255,255,255,.04);border:1px solid var(--line);
+  border-radius:9px;padding:8px 10px;user-select:all}
+.qr-steps{margin:0;padding-left:18px;color:var(--mute);font-size:12.5px;line-height:1.55}
+.qr-st{display:flex;align-items:center;gap:8px;font-size:13px;font-weight:600}
+.qr-st i{width:9px;height:9px;border-radius:50%;background:var(--warn);flex:none}
+.qr-st.ok i{background:var(--ok);box-shadow:0 0 8px var(--ok)} .qr-st.bad i{background:var(--bad)}
 
 /* ---------- source ---------- */
 .srcform{display:flex;gap:8px;margin-top:10px}
@@ -206,6 +228,13 @@ select{background:var(--bg2);border:1px solid var(--line-hi);border-radius:8px;p
       <button class="btn" id="btn-snap">Snapshot</button>
       <button class="btn danger" id="btn-reset">Reset stats</button>
     </div>
+    <div class="toolbar stage" role="group" aria-label="Stage controls">
+      <span class="stage-l">Stage</span>
+      <button class="btn" id="btn-lock" aria-pressed="false" title="Lock the confirmed court calibration so stray clicks / keys cannot change it">&#x1F513; Lock calibration [L]</button>
+      <button class="btn" id="btn-exp" aria-pressed="false" title="Toggle webcam Auto Exposure / Fast Sport Shutter (max FPS) without restarting the camera">Auto Exposure [E]</button>
+      <button class="btn" id="btn-failover" title="Hot-swap Live camera &harr; clean match replay; the current view stays live until the other source is ready">&#x21C4; Failover [F12]</button>
+      <button class="btn" id="btn-camset" title="Open the webcam driver settings on the server machine (Power Line Frequency 50 Hz)">Camera settings</button>
+    </div>
   </section>
 
   <!-- Minimap -->
@@ -230,6 +259,8 @@ select{background:var(--bg2);border:1px solid var(--line-hi);border-radius:8px;p
   <section class="card c-src" aria-label="Source switcher">
     <div class="hd"><h3>Source</h3><span id="src-state" style="font-size:12px;color:var(--mute)"></span></div>
     <div class="bd">
+      <button class="btn qr" id="btn-qr" type="button" title="Pair a phone as the court camera: scan the QR code [M]">
+        <span class="live" aria-hidden="true"></span><span id="qr-lbl">&#x1F4F1; Mobile QR Portal</span></button>
       <div class="seg" role="group" aria-label="Source type" id="src-seg">
         <button data-src="sim" aria-pressed="true">Match Replay</button>
         <button data-src="webcam" aria-pressed="false">Webcam</button>
@@ -269,6 +300,21 @@ select{background:var(--bg2);border:1px solid var(--line-hi);border-radius:8px;p
 </main>
 <div id="toast" role="status" aria-live="polite"></div>
 
+<dialog id="qr-modal" aria-labelledby="qr-title">
+  <div class="qr-in">
+    <div class="qr-hd"><h3 id="qr-title">&#x1F4F1; Mobile QR Portal</h3>
+      <button class="btn" id="qr-close" type="button" aria-label="Close">&#x2715;</button></div>
+    <img class="qr-img" id="qr-img" alt="QR code that opens the PadelIQ phone camera page">
+    <div class="qr-url" id="qr-url">&hellip;</div>
+    <div class="qr-st" id="qr-st" role="status" aria-live="polite"><i></i><span>Starting the HTTPS portal&hellip;</span></div>
+    <ol class="qr-steps">
+      <li>Join the same Wi-Fi, scan the code with the phone camera.</li>
+      <li>Accept the local certificate once, tap <b>Start Camera</b>.</li>
+      <li>Mount the phone in landscape behind the baseline. The stage switches to it automatically.</li>
+    </ol>
+    <button class="btn" id="qr-show" type="button">Show the QR on the main stage feed</button>
+  </div>
+</dialog>
 <script>
 "use strict";
 const $ = s => document.querySelector(s);
@@ -421,6 +467,9 @@ function renderStatus(st){
   $("#live-text").textContent = state === "switching" ? "SWITCHING" : state === "error" ? "SOURCE ERROR" :
     cam === "live" ? "LIVE" : cam === "reconnecting" ? "RECONNECTING" : "CONNECTING";
   $("#src-label").textContent = st.source.label || "—";
+  if(st.mobile){ const on = st.source.kind === "mobile" && st.mobile.connected;
+    $("#btn-qr").classList.toggle("on", on);
+    $("#qr-lbl").textContent = String.fromCodePoint(0x1F4F1) + (on ? " Phone camera live" + (st.mobile.stream_fps ? ` · ${Math.round(st.mobile.stream_fps)} fps` : "") : " Mobile QR Portal"); }
   $("#src-state").textContent = st.source.error ? "" : (st.source.kind ? st.source.kind.toUpperCase() : "");
   if(st.source.error){ const h = $("#src-hint"); h.textContent = st.source.error; h.className = "hint err"; }
   const pl = st.pipeline, lt = st.latency || {};
@@ -436,6 +485,14 @@ function renderStatus(st){
   $("#h-cpu").textContent = st.system && st.system.cpu_pct != null ? Math.round(st.system.cpu_pct) : "–";
   $("#h-mem").textContent = st.system && st.system.process_mb != null ? Math.round(st.system.process_mb) : "–";
   $("#h-rec").textContent = st.source.reconnects; $("#h-up").textContent = fmtT(st.uptime_s);
+  stageState = {locked: !!(st.calibration && st.calibration.locked),
+                exp: (st.camera && st.camera.exposure && st.camera.exposure.mode) || "auto",
+                webcam: !!(st.camera && st.camera.is_webcam)};
+  const bl = $("#btn-lock"); bl.setAttribute("aria-pressed", stageState.locked);
+  bl.innerHTML = stageState.locked ? "&#x1F512; Calibration Locked [L]" : "&#x1F513; Lock calibration [L]";
+  const be = $("#btn-exp"); be.setAttribute("aria-pressed", stageState.exp === "sport");
+  be.textContent = (stageState.exp === "sport" ? "Fast Sport Shutter (Max FPS)" : "Auto Exposure") + " [E]";
+  be.disabled = !stageState.webcam; $("#btn-camset").disabled = !stageState.webcam;
   const errs = Object.values(st.errors).reduce((a,b) => a+b, 0);
   $("#health-ok").textContent = errs ? errs + " recovered" : "All systems nominal";
   $("#health-ok").style.color = errs ? "var(--warn)" : "var(--ok)";
@@ -508,6 +565,49 @@ $("#src-form").addEventListener("submit", async ev => {
     hint.textContent = "Connecting to " + j.switching_to + (srcType === "youtube" ? " (resolving with yt-dlp…)" : "");
   }catch(e){ hint.className = "hint err"; hint.textContent = e.message; }
 });
+
+/* ---------- mobile QR portal ---------- */
+const qrModal = $("#qr-modal");
+let qrTimer = 0, qrBase = null;
+function qrStatus(cls, text){ const el = $("#qr-st"); el.className = "qr-st " + (cls || ""); el.querySelector("span").textContent = text; }
+async function qrPoll(){
+  let m, st;
+  try{ [m, st] = await Promise.all([fetch("/api/mobile/status", {cache:"no-store"}).then(r => r.json()),
+                                    fetch("/api/status", {cache:"no-store"}).then(r => r.json())]); }catch(e){ return; }
+  if(qrBase === null) qrBase = m.frames_received;
+  if(m.url && $("#qr-url").dataset.url !== m.url){ $("#qr-url").dataset.url = m.url; $("#qr-url").textContent = m.url.split("?")[0];
+    $("#qr-url").title = m.url; $("#qr-img").src = "/api/qr.png?size=640&t=" + Date.now(); }
+  const live = st.source && st.source.kind === "mobile" && st.source.state === "ready" && m.connected && m.frames_received > qrBase;
+  if(live){ closeQr(); toast("Phone camera live - analyzed stream on stage"); return; }
+  if(!m.https_enabled) qrStatus("bad", "HTTPS portal unavailable: " + (m.https_error || "starting…"));
+  else if(m.connected) qrStatus("ok", m.frames_received > qrBase ? "Phone streaming - switching the stage feed…" : "Phone connected - waiting for the camera…");
+  else qrStatus("", `Waiting for a phone on ${m.lan_ip}:${m.https_port} …`);
+}
+function openQr(){
+  if(qrModal.open) return;
+  qrBase = null; $("#qr-url").dataset.url = "";
+  if(qrModal.showModal) qrModal.showModal(); else qrModal.setAttribute("open", "");
+  qrPoll(); qrTimer = setInterval(qrPoll, 600);
+}
+function closeQr(){ clearInterval(qrTimer); qrTimer = 0; if(qrModal.open){ if(qrModal.close) qrModal.close(); else qrModal.removeAttribute("open"); } }
+qrModal.addEventListener("close", () => { clearInterval(qrTimer); qrTimer = 0; });
+$("#btn-qr").addEventListener("click", openQr);
+$("#qr-close").addEventListener("click", closeQr);
+$("#qr-show").addEventListener("click", async () => {
+  try{ await api("/api/source", {type: "mobile"}); toast("Stage feed shows the pairing QR until the phone streams"); }catch(e){} });
+
+/* ---------- stage controls ---------- */
+let stageState = {locked: false, exp: "auto", webcam: false};
+async function stageLock(){ try{ const j = await api("/api/calibration/lock", {locked: !stageState.locked});
+  stageState.locked = j.locked; toast(j.locked ? "Calibration locked" : "Calibration unlocked"); }catch(e){} }
+async function stageExposure(){ try{ const j = await api("/api/camera/exposure", {mode: "toggle"});
+  stageState.exp = j.mode; toast("Camera: " + j.label); }catch(e){} }
+async function stageFailover(){ try{ const j = await api("/api/failover", {});
+  toast("Failover -> " + j.switching_to + " (current view stays live until ready)"); }catch(e){} }
+$("#btn-lock").addEventListener("click", stageLock);
+$("#btn-exp").addEventListener("click", stageExposure);
+$("#btn-failover").addEventListener("click", stageFailover);
+$("#btn-camset").addEventListener("click", async () => { try{ const j = await api("/api/camera/settings", {}); toast(j.note); }catch(e){} });
 
 /* ---------- toolbar ---------- */
 $("#btn-reset").addEventListener("click", async () => { await api("/api/reset", {}); toast("Statistics reset"); });
@@ -639,11 +739,19 @@ $("#rv-rerun").addEventListener("click", async () => { endDrag(); endCalib();
   try{ const j = await api("/api/calibration/auto", {}); toast(`Court locked (confidence ${Math.round(j.info.confidence_pct || 0)}%)`); }catch(e){} });
 window.addEventListener("resize", () => { if(vp.classList.contains("calibrating")) drawCalib(); if(drag) drawDrag(); drawMap(lastTel); });
 document.addEventListener("keydown", ev => {
+  if(ev.key === "F12"){ ev.preventDefault(); stageFailover(); return; }
+  if(!["INPUT","SELECT","TEXTAREA"].includes(document.activeElement.tagName) && !ev.ctrlKey && !ev.metaKey){
+    const kk = ev.key.toLowerCase();
+    if(kk === "l"){ stageLock(); return; }
+    if(kk === "m"){ qrModal.open ? closeQr() : openQr(); return; }
+    if(kk === "e" && stageState.webcam){ stageExposure(); return; }
+    if(stageState.locked && ["c","n","a"].includes(kk)){ toast("Calibration is locked - press L to unlock", true); return; }
+  }
   if(ev.key === "Escape"){ if(vp.classList.contains("calibrating")) endCalib(); if(drag) endDrag(); }
   const rv = lastTel && lastTel.calibration_review; if(!rv || ["INPUT","SELECT","TEXTAREA"].includes(document.activeElement.tagName)) return;
   const k = ev.key.toLowerCase();
   if((ev.key === "Enter" || k === "y" || (k === "c" && drag)) && (rv.state === "review" || rv.state === "manual")) $("#rv-confirm").click();
-  else if((k === "m" || k === "c") && rv.state !== "detecting" && !drag) startDrag();
+  else if(k === "c" && rv.state !== "detecting" && !drag) startDrag();
   else if(k === "n" && (drag || rv.state === "manual" || vp.classList.contains("calibrating"))){
     if(vp.classList.contains("calibrating")) startDrag(); else startFreshClickCalib();
   }

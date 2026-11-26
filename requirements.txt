@@ -3,12 +3,17 @@ numpy>=1.26
 opencv-python>=4.9
 scipy>=1.11
 ultralytics>=8.3          # YOLOv8 detection + pose (pulls in torch)
-openvino>=2024.0          # fast CPU pose backend (yolov8n-pose_openvino_model)
+openvino>=2024.0          # FP16 CPU detection + pose (yolov8n[-pose]_openvino_model)
 
 # Enterprise web command center
 fastapi>=0.110
 uvicorn>=0.29
 psutil>=5.9               # optional: CPU / RAM in the health panel
+
+# Mobile QR camera portal (HTTPS :8443, self-signed certs generated on first run)
+qrcode[pil]>=7.4          # QR code + PIL text for the pairing screen
+cryptography>=41          # self-signed certificate for the phone's secure context
+websockets>=12            # WebSocket transport for uvicorn (/ws/mobile-cam, /ws/telemetry)
 
 # Optional sources
 yt-dlp>=2024.1            # YouTube video / live URLs

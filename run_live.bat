@@ -28,6 +28,7 @@ echo   [1] ENTERPRISE WEB COMMAND CENTER  (http://localhost:8000)
 echo ----------------------------------------------------------
 echo   Desktop (OpenCV window) modes:
 echo   [2] Live Webcam (BRIO preferred)   (--source webcam, MJPG 720p)
+echo   [M] Mobile QR Phone Camera         (--source mobile, scan QR, HTTPS :8443)
 echo   [3] ESP32-CAM Stream               (http://IP:81/stream)
 echo   [4] RTSP IP Camera
 echo   [5] YouTube video / live URL       (via yt-dlp -g)
@@ -38,8 +39,8 @@ echo   [8] Run headless smoke test        (--test-run 100)
 echo   [9] Auto-calibrate the demo court  (from court lines)
 echo   [Q] Quit
 echo ----------------------------------------------------------
-echo   Desktop keys: [C] calibrate ([H] reference) [R] reset
-echo                 [S] record MP4  [Q] quit
+echo   Desktop keys: [C] calibrate [L] lock [E] shutter [F] fullscreen
+echo                 [F12] failover [M] QR portal [S] record [Q] quit
 echo ==========================================================
 set "CHOICE="
 set /p "CHOICE=Select an option: "
@@ -51,6 +52,7 @@ if not defined CHOICE (
 set "EMPTY_COUNT=0"
 if /i "!CHOICE!"=="1" goto enterprise
 if /i "!CHOICE!"=="2" goto webcam
+if /i "!CHOICE!"=="m" goto mobile
 if /i "!CHOICE!"=="3" goto esp32
 if /i "!CHOICE!"=="4" goto rtsp
 if /i "!CHOICE!"=="5" goto youtube
@@ -99,6 +101,17 @@ goto done
 set "CAMIDX=webcam"
 set /p "CAMIDX=Webcam index [Enter = best camera, Logitech BRIO preferred]: "
 %PY% padeliq_live_stream.py --source !CAMIDX!
+set "RC=!errorlevel!"
+goto done
+
+:mobile
+echo Phone: join the same Wi-Fi, scan the QR code in the window, accept the certificate once.
+echo (if Windows Firewall asks, allow Python on private networks so the phone can reach port 8443)
+%PY% -c "import qrcode, cryptography" 2>nul || (
+    echo Installing qrcode + cryptography ...
+    %PY% -m pip install -q "qrcode[pil]" cryptography
+)
+%PY% padeliq_live_stream.py --source mobile
 set "RC=!errorlevel!"
 goto done
 

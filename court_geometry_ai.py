@@ -61,22 +61,121 @@ DEFAULT_LEG_TORSO_RATIO = 1.68
 # =====================================================================
 # 1. Hybrid Full-Recall Person + Crop YOLOv8n-Pose Detector
 # =====================================================================
+class OVYolo:
+    """Direct OpenVINO runner for Ultralytics YOLOv8 exports (detect / pose): letterbox -> infer -> NumPy decode ->
+    NMS. Skips the Ultralytics predict wrapper, which costs ~8-10 ms of Python / torch overhead per call on CPU.
+    Works with static rectangular inputs (e.g. 288x480 = a 16:9 frame without square letterbox padding)."""
+
+    def __init__(self, model_dir, task="detect"):
+        import glob
+        import openvino as ov
+        xmls = sorted(glob.glob(os.path.join(model_dir, "*.xml")))
+        if not xmls:
+            raise FileNotFoundError(f"no OpenVINO model in {model_dir}")
+        self.task = task
+        core = ov.Core()
+        model = core.read_model(xmls[0])
+        if model.input(0).get_partial_shape().is_dynamic:      # dynamic export -> fix to its metadata size
+            sz = PoseCourtDetector._openvino_imgsz(model_dir) or 192
+            model.reshape({model.input(0).get_any_name(): [1, 3, int(sz), int(sz)]})
+        self.compiled = core.compile_model(model, "CPU", {"PERFORMANCE_HINT": "LATENCY"})
+        shp = self.compiled.input(0).get_shape()
+        self.in_h, self.in_w = int(shp[2]), int(shp[3])
+        self.req = self.compiled.create_infer_request()
+        self._canvas = np.full((self.in_h, self.in_w, 3), 114, np.uint8)
+
+    def _infer(self, img):
+        h, w = img.shape[:2]
+        r = min(self.in_w / float(w), self.in_h / float(h))
+        nw, nh = max(1, int(round(w * r))), max(1, int(round(h * r)))
+        px, py = (self.in_w - nw) // 2, (self.in_h - nh) // 2
+        canvas = self._canvas
+        canvas[:] = 114
+        canvas[py:py + nh, px:px + nw] = cv2.resize(img, (nw, nh), interpolation=cv2.INTER_LINEAR) \
+            if (nw, nh) != (w, h) else img
+        blob = cv2.dnn.blobFromImage(canvas, 1.0 / 255.0, swapRB=True)
+        self.req.infer({0: blob})
+        return self.req.get_output_tensor(0).data[0], r, px, py       # (C, N)
+
+    @staticmethod
+    def _nms(cxcywh, scores, conf, iou=0.7):
+        if len(scores) == 0:
+            return np.zeros((0,), int)
+        rects = np.stack([cxcywh[:, 0] - cxcywh[:, 2] / 2, cxcywh[:, 1] - cxcywh[:, 3] / 2,
+                          cxcywh[:, 2], cxcywh[:, 3]], axis=1)
+        idx = cv2.dnn.NMSBoxes(rects.tolist(), scores.astype(float).tolist(), float(conf), float(iou))
+        return np.array(idx, int).reshape(-1)
+
+    @staticmethod
+    def _to_xyxy(cxcywh, r, px, py):
+        xyxy = np.stack([cxcywh[:, 0] - cxcywh[:, 2] / 2, cxcywh[:, 1] - cxcywh[:, 3] / 2,
+                         cxcywh[:, 0] + cxcywh[:, 2] / 2, cxcywh[:, 1] + cxcywh[:, 3] / 2], axis=1)
+        xyxy[:, [0, 2]] = (xyxy[:, [0, 2]] - px) / r
+        xyxy[:, [1, 3]] = (xyxy[:, [1, 3]] - py) / r
+        return xyxy.astype(np.float32)
+
+    def detect(self, img, classes, conf):
+        """-> xyxy (M,4), cls (M,), conf (M,) in img pixels."""
+        out, r, px, py = self._infer(img)
+        all_b, all_c, all_s = [], [], []
+        for c in classes:
+            sc = out[4 + c]
+            keep = np.flatnonzero(sc >= conf)
+            if keep.size == 0:
+                continue
+            b = out[:4, keep].T
+            k = self._nms(b, sc[keep], conf)
+            if k.size:
+                all_b.append(self._to_xyxy(b[k], r, px, py))
+                all_c.append(np.full(k.size, c, int))
+                all_s.append(sc[keep][k].astype(np.float32))
+        if not all_b:
+            return np.zeros((0, 4), np.float32), np.zeros((0,), int), np.zeros((0,), np.float32)
+        return np.vstack(all_b), np.concatenate(all_c), np.concatenate(all_s)
+
+    def pose(self, img, conf):
+        """-> xyxy (M,4), keypoints (M,17,3) [x, y, conf], conf (M,) in img pixels."""
+        out, r, px, py = self._infer(img)
+        sc = out[4]
+        keep = np.flatnonzero(sc >= conf)
+        if keep.size == 0:
+            return np.zeros((0, 4), np.float32), np.zeros((0, 17, 3), np.float32), np.zeros((0,), np.float32)
+        b = out[:4, keep].T
+        k = self._nms(b, sc[keep], conf)
+        kp = out[5:, keep][:, k].T.reshape(-1, 17, 3).astype(np.float32)
+        kp[:, :, 0] = (kp[:, :, 0] - px) / r
+        kp[:, :, 1] = (kp[:, :, 1] - py) / r
+        return self._to_xyxy(b[k], r, px, py), kp, sc[keep][k].astype(np.float32)
+
+
 class PoseCourtDetector:
     """Combines full-frame YOLOv8n detection (high recall on occluded far-court players +
     COCO sports-ball class 32) with batched YOLOv8n-pose crop inference (4x resolution on
     ankles 15, 16 and hip/shoulder keypoints). Falls back gracefully if one weight is absent."""
 
-    def __init__(self, app_dir=None, model_path="yolov8n.pt", imgsz=640, conf=0.26, crop_size=192):
+    # Pose refresh policy (per player): fresh pose every POSE_STRIDE AI ticks, or sooner when the box jumped.
+    POSE_STRIDE = 2
+    POSE_JUMP_FRAC = 0.25          # box centre moved > 25% of its height since the last pose -> fresh pose
+    KP_EMA_ALPHA = 0.65            # keypoint temporal smoothing (weight of the new measurement)
+
+    def __init__(self, app_dir=None, model_path="yolov8n.pt", imgsz=640, conf=0.26, crop_size=192, backend="auto"):
         self.app_dir = app_dir or os.path.dirname(os.path.abspath(__file__))
         self.imgsz = int(imgsz)
+        self.det_imgsz = int(imgsz)
         self.conf = float(conf)
         self.crop_size = int(crop_size)
+        self.backend_pref = backend            # auto (OpenVINO first) | openvino | pytorch
         self.det_model = None
         self.pose_model = None
+        self.det_backend = "none"
         self.pose_backend = "none"
         self.lock = threading.Lock()
         self.last_keypoints = []
         self.last_balls = np.zeros((0, 4), dtype=np.float32)
+        self.roi = None                        # (x1, y1, x2, y2) court ROI for detection, None = full frame
+        self.adaptive_pose = True
+        self._pose_cache = []                  # [(box (4,), kps (17,3), ticks_since_pose)]
+        self.stats = {"pose_crops": 0, "pose_reused": 0}
         self._load_models(model_path)
 
     def _resolve(self, p):
@@ -90,27 +189,60 @@ class PoseCourtDetector:
         except Exception:
             return
 
-        # 1) Primary person + ball detector (`yolov8n.pt` or caller's model)
+        # 1) Primary person + ball detector: OpenVINO FP16 export (<name>_openvino_model, fixed input size read
+        #    from its metadata) first, then the PyTorch weights.
         det_p = self._resolve(model_path)
-        if not os.path.isfile(det_p):
+        if not os.path.exists(det_p):
             det_p = self._resolve("yolov8n.pt")
-        if os.path.isfile(det_p) and "pose" not in os.path.basename(det_p).lower():
+        det_cands = []
+        if det_p.endswith("_openvino_model") and os.path.isdir(det_p):
+            det_cands.append(("openvino", det_p))
+        else:
+            ov_det = os.path.splitext(det_p)[0] + "_openvino_model"
+            if self.backend_pref != "pytorch" and os.path.isdir(ov_det):
+                det_cands.append(("openvino", ov_det))
+            if self.backend_pref != "openvino" and os.path.isfile(det_p):
+                det_cands.append(("pytorch", det_p))
+        for name, path in det_cands:
+            if "pose" in os.path.basename(path).lower():
+                continue
+            if name == "openvino":
+                try:
+                    m = OVYolo(path, "detect")
+                    m.detect(np.zeros((m.in_h, m.in_w, 3), np.uint8), [0], 0.5)
+                    self.det_model, self.det_backend, self.det_imgsz = m, "openvino", (m.in_h, m.in_w)
+                    break
+                except Exception:
+                    pass
             try:
-                m = YOLO(det_p)
-                m.predict(np.zeros((320, 320, 3), np.uint8), imgsz=320, verbose=False)
-                self.det_model = m
+                m = YOLO(path, task="detect")
+                isz = self.imgsz
+                if name == "openvino":
+                    isz = self._openvino_imgsz(path) or isz
+                m.predict(np.zeros((isz, isz, 3), np.uint8), imgsz=isz, verbose=False)
+                self.det_model, self.det_backend, self.det_imgsz = m, name, int(isz)
+                break
             except Exception:
-                self.det_model = None
+                continue
 
         # 2) Pose keypoint model: OpenVINO (`~6ms` per 192px crop on CPU!) first, PyTorch fallback
         pose_cands = []
         ov_dir = os.path.join(self.app_dir, "yolov8n-pose_openvino_model")
         pt_pose = os.path.join(self.app_dir, "yolov8n-pose.pt")
-        if os.path.isdir(ov_dir):
+        if os.path.isdir(ov_dir) and self.backend_pref != "pytorch":
             pose_cands.append(("openvino-pose", ov_dir))
         if os.path.isfile(pt_pose):
             pose_cands.append(("pytorch-pose", pt_pose))
         for name, path in pose_cands:
+            if name == "openvino-pose":
+                try:
+                    pm = OVYolo(path, "pose")
+                    pm.pose(np.zeros((pm.in_h, pm.in_w, 3), np.uint8), 0.5)
+                    self.pose_model, self.pose_backend = pm, name
+                    self.crop_size = pm.in_w
+                    break
+                except Exception:
+                    pass
             try:
                 pm = YOLO(path, task="pose")
                 pm.predict([np.zeros((self.crop_size, self.crop_size, 3), np.uint8)], imgsz=self.crop_size, verbose=False)
@@ -120,9 +252,45 @@ class PoseCourtDetector:
             except Exception:
                 continue
 
+    @staticmethod
+    def _openvino_imgsz(path):
+        """Static input size of an Ultralytics OpenVINO export (metadata.yaml 'imgsz: [h, w]')."""
+        try:
+            txt = open(os.path.join(path, "metadata.yaml"), encoding="utf-8").read()
+            import re
+            m = re.search(r"imgsz:\s*\n\s*-\s*(\d+)", txt) or re.search(r"imgsz:\s*\[(\d+)", txt)
+            return int(m.group(1)) if m else None
+        except Exception:
+            return None
+
     @property
     def ready(self):
         return self.det_model is not None or self.pose_model is not None
+
+    def set_roi(self, roi):
+        """Restrict detection to roi = (x1, y1, x2, y2) in frame pixels (None = full frame)."""
+        self.roi = None if roi is None else tuple(int(v) for v in roi)
+
+    @staticmethod
+    def court_roi(corners_px, frame_shape, margin=0.15, head_margin=0.30):
+        """Bounding box of the court polygon + `margin` on the sides / bottom and `head_margin` on top
+        (far-baseline players' heads stick out above the court floor)."""
+        if corners_px is None:
+            return None
+        pts = np.asarray(corners_px, dtype=np.float32).reshape(-1, 2)
+        if pts.shape[0] < 4 or not np.all(np.isfinite(pts)):
+            return None
+        h, w = frame_shape[:2]
+        x1, y1 = pts.min(axis=0)
+        x2, y2 = pts.max(axis=0)
+        bw, bh = x2 - x1, y2 - y1
+        if bw < 32 or bh < 32:
+            return None
+        x1, x2 = max(0, x1 - margin * bw), min(w, x2 + margin * bw)
+        y1, y2 = max(0, y1 - head_margin * bh), min(h, y2 + margin * bh)
+        if (x2 - x1) * (y2 - y1) > 0.92 * w * h:      # ROI ~ whole frame: cropping would not save anything
+            return None
+        return int(x1), int(y1), int(x2), int(y2)
 
     def _make_crop(self, frame, box):
         h, w = frame.shape[:2]
@@ -160,25 +328,51 @@ class PoseCourtDetector:
         with self.lock:
             # Step 1: High-recall person + sports-ball detection
             if self.det_model is not None:
+                roi = self.roi
+                ox = oy = 0
+                src = frame
+                if roi is not None:
+                    rx1, ry1, rx2, ry2 = roi
+                    rx1, ry1 = max(0, rx1), max(0, ry1)
+                    rx2, ry2 = min(w, rx2), min(h, ry2)
+                    if rx2 - rx1 >= 64 and ry2 - ry1 >= 64:
+                        src, ox, oy = frame[ry1:ry2, rx1:rx2], rx1, ry1
+                xyxy = None
                 try:
-                    res = self.det_model.predict(
-                        frame, classes=[0, 32], conf=min(thr, 0.15), imgsz=self.imgsz, verbose=False
-                    )
+                    if isinstance(self.det_model, OVYolo):
+                        xyxy, cls, cf = self.det_model.detect(src, [0, 32], min(thr, 0.15))
+                    else:
+                        res = self.det_model.predict(
+                            src, classes=[0, 32], conf=min(thr, 0.15), imgsz=self.det_imgsz, verbose=False
+                        )
+                        if res and res[0].boxes is not None:
+                            b = res[0].boxes
+                            xyxy = b.xyxy.cpu().numpy().astype(np.float32)
+                            cls = b.cls.cpu().numpy().astype(int)
+                            cf = b.conf.cpu().numpy().astype(np.float32)
                 except Exception:
-                    res = None
-                if not res or res[0].boxes is None or len(res[0].boxes) == 0:
+                    xyxy = None
+                if xyxy is None or len(xyxy) == 0:
                     self.last_keypoints = []
+                    self._pose_cache = []
                     return np.zeros((0, 4), np.float32), [], np.zeros((0,), np.float32)
-                b = res[0].boxes
-                xyxy = b.xyxy.cpu().numpy().astype(np.float32)
-                cls = b.cls.cpu().numpy().astype(int)
-                cf = b.conf.cpu().numpy().astype(np.float32)
+                if ox or oy:
+                    xyxy[:, [0, 2]] += ox
+                    xyxy[:, [1, 3]] += oy
                 self.last_balls = xyxy[(cls == 32) & (cf >= 0.15)]
                 keep = (cls == 0) & (cf >= thr)
                 boxes = xyxy[keep]
                 confs = cf[keep]
             else:
                 # Pose-only fallback
+                if isinstance(self.pose_model, OVYolo):
+                    try:
+                        boxes, kp, confs = self.pose_model.pose(frame, thr)
+                    except Exception:
+                        boxes, kp, confs = np.zeros((0, 4), np.float32), np.zeros((0, 17, 3), np.float32), np.zeros((0,), np.float32)
+                    kps_out = [kp[i] for i in range(len(boxes))]
+                    self.last_keypoints = kps_out
+                    return boxes, kps_out, confs
                 try:
                     res = self.pose_model.predict(frame, conf=thr, imgsz=self.imgsz, verbose=False)
                 except Exception:
@@ -209,36 +403,99 @@ class PoseCourtDetector:
                     [i for i in range(len(boxes)) if (boxes[i, 3] - boxes[i, 1]) >= 0.075 * h and boxes[i, 3] >= 0.25 * h],
                     key=lambda i: -(boxes[i, 3] - boxes[i, 1]) * (0.4 + 0.6 * (boxes[i, 3] / h)),
                 )[:max_pose_crops]
-                if cand_order:
-                    crops, metas = [], []
+                # Adaptive pose stride: reuse the previous skeleton (shifted / scaled with the box) for players
+                # whose pose is fresh enough, run the pose net only on the rest.
+                prev_cache, new_cache, matched = self._pose_cache, {}, {}
+                if self.adaptive_pose and prev_cache:
                     for idx in cand_order:
+                        j = self._match_cache(boxes[idx], prev_cache)
+                        if j is None:
+                            continue
+                        pbox, pkps, age = prev_cache[j]
+                        bh = max(1.0, boxes[idx, 3] - boxes[idx, 1])
+                        jump = np.hypot((boxes[idx, 0] + boxes[idx, 2] - pbox[0] - pbox[2]) * 0.5,
+                                        (boxes[idx, 1] + boxes[idx, 3] - pbox[1] - pbox[3]) * 0.5)
+                        matched[idx] = j
+                        if age + 1 < self.POSE_STRIDE and jump < self.POSE_JUMP_FRAC * bh:
+                            kps_out[idx] = self._warp_kps(pkps, pbox, boxes[idx])
+                            new_cache[idx] = (boxes[idx].copy(), kps_out[idx], age + 1)
+                            self.stats["pose_reused"] += 1
+                run_idx = [i for i in cand_order if i not in new_cache]
+                if run_idx:
+                    crops, metas = [], []
+                    for idx in run_idx:
                         cr, meta = self._make_crop(frame, boxes[idx])
                         crops.append(cr)
                         metas.append((idx, meta))
+                    self.stats["pose_crops"] += len(run_idx)
                     try:
-                        pres = self.pose_model.predict(crops, imgsz=self.crop_size, conf=0.20, verbose=False)
-                        for pr, (idx, (X1, Y1, sc)) in zip(pres, metas):
-                            if pr.keypoints is None or pr.boxes is None or len(pr.boxes) == 0:
+                        for (pb, pkxy, pkc), (idx, (X1, Y1, sc)) in zip(self._pose_crops(crops), metas):
+                            if len(pb) == 0:
                                 continue
                             bx = boxes[idx]
                             exp = np.array([(bx[0] - X1) / sc, (bx[1] - Y1) / sc, (bx[2] - X1) / sc, (bx[3] - Y1) / sc])
-                            pb = pr.boxes.xyxy.cpu().numpy()
                             ious = [self._box_iou(exp, q) for q in pb]
                             j = int(np.argmax(ious))
                             if ious[j] < 0.22:
                                 continue
-                            kxy = pr.keypoints.xy.cpu().numpy()[j]
-                            kc = pr.keypoints.conf.cpu().numpy()[j] if pr.keypoints.conf is not None else np.ones(17, np.float32)
+                            kxy, kc = pkxy[j], pkc[j]
                             arr = np.zeros((17, 3), dtype=np.float32)
                             arr[:, 0] = kxy[:, 0] * sc + X1
                             arr[:, 1] = kxy[:, 1] * sc + Y1
                             arr[:, 2] = kc
+                            if idx in matched:          # temporal EMA against the previous skeleton
+                                pbox, pkps, _ = prev_cache[matched[idx]]
+                                arr = self._ema_kps(arr, self._warp_kps(pkps, pbox, boxes[idx]))
                             kps_out[idx] = arr
+                            new_cache[idx] = (boxes[idx].copy(), arr, 0)
                     except Exception:
                         pass
+                self._pose_cache = list(new_cache.values())
 
         self.last_keypoints = kps_out
         return boxes, kps_out, confs
+
+    def _pose_crops(self, crops):
+        """-> [(boxes (M,4), kps_xy (M,17,2), kps_conf (M,17))] per crop, either backend."""
+        out = []
+        if isinstance(self.pose_model, OVYolo):
+            for cr in crops:
+                b, kp, _ = self.pose_model.pose(cr, 0.20)
+                out.append((b, kp[:, :, :2], kp[:, :, 2]))
+            return out
+        for pr in self.pose_model.predict(crops, imgsz=self.crop_size, conf=0.20, verbose=False):
+            if pr.keypoints is None or pr.boxes is None or len(pr.boxes) == 0:
+                out.append((np.zeros((0, 4)), None, None))
+                continue
+            kxy = pr.keypoints.xy.cpu().numpy()
+            kc = pr.keypoints.conf.cpu().numpy() if pr.keypoints.conf is not None else np.ones(kxy.shape[:2], np.float32)
+            out.append((pr.boxes.xyxy.cpu().numpy(), kxy, kc))
+        return out
+
+    def _match_cache(self, box, cache, min_iou=0.3):
+        best, best_iou = None, min_iou
+        for j, (pbox, _, _) in enumerate(cache):
+            iou = self._box_iou(box, pbox)
+            if iou > best_iou:
+                best, best_iou = j, iou
+        return best
+
+    @staticmethod
+    def _warp_kps(kps, old_box, new_box):
+        """Move a skeleton with its box (translation + scale): velocity prediction between pose ticks."""
+        out = kps.copy()
+        ow, oh = max(1.0, old_box[2] - old_box[0]), max(1.0, old_box[3] - old_box[1])
+        nw, nh = max(1.0, new_box[2] - new_box[0]), max(1.0, new_box[3] - new_box[1])
+        out[:, 0] = new_box[0] + (kps[:, 0] - old_box[0]) * (nw / ow)
+        out[:, 1] = new_box[1] + (kps[:, 1] - old_box[1]) * (nh / oh)
+        return out
+
+    def _ema_kps(self, new, prev):
+        a = self.KP_EMA_ALPHA
+        both = (new[:, 2] > KCONF) & (prev[:, 2] > KCONF)
+        out = new.copy()
+        out[both, :2] = a * new[both, :2] + (1.0 - a) * prev[both, :2]
+        return out
 
 
 def pose_ground_point(box, kps, frame_shape=None, leg_ratio=DEFAULT_LEG_TORSO_RATIO):

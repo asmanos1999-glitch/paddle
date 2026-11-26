@@ -73,6 +73,8 @@ SERVICE_LINE_FAR_M = NET_Y_M + SERVICE_LINE_OFFSET_M    # 16.95 m
 LIVE_CALIBRATION_FILE = os.path.join(APP_DIR, "live_court_calibration.json")
 SIM_CALIBRATION_FILE = os.path.join(APP_DIR, "sim_court_calibration.json")
 WEBCAM_SOURCE_NAMES = ("webcam", "brio", "camera", "usb", "cam")
+MOBILE_CALIBRATION_FILE = os.path.join(APP_DIR, "mobile_court_calibration.json")
+MOBILE_SOURCE_NAMES = ("mobile", "phone", "qr", "mobile-qr", "mobile_qr")
 # Ranked name hints for the external colour webcam (DirectShow friendly names). IR / depth sensors are skipped.
 PREFERRED_CAMERA_HINTS = ("brio", "logitech", "c920", "c922", "c930", "streamcam", "elgato", "obsbot", "insta360")
 IR_CAMERA_HINTS = (" ir ", "infrared", "ir camera", "depth", "windows hello")
@@ -80,11 +82,18 @@ LEGACY_VIDEO_CALIBRATION_FILE = os.path.join(APP_DIR, "court_calibration.json")
 VERIFY_SCREENSHOT = os.path.join(APP_DIR, "live_hud_verified.jpg")
 PREFERRED_SIM_VIDEOS = ("clean_padel_match.mp4", "padel_input.mp4")
 
+KCONF = CG.KCONF                # pose keypoint confidence threshold
 STALL_TIMEOUT_S = 2.5           # watchdog: no frames for this long -> reconnect
 WEBCAM_PROFILE_FILE = os.path.join(APP_DIR, "webcam_profiles.json")   # negotiated mode per webcam index
 DEFAULT_CAM_SIZE = (1280, 720)
 DEFAULT_CAM_FPS = 60            # request the max; the driver clamps to what the sensor/USB mode delivers
-DEFAULT_IMGSZ = 512             # YOLO input: ~30% faster than 640 on CPU with the same 4-player recall
+DEFAULT_IMGSZ = 480             # YOLO input for the PyTorch fallback (the OpenVINO export is a fixed 288x480 = 16:9)
+WEBCAM_STALL_S = 1.0            # USB camera: no frame for 1 s -> hold the last frame and re-initialise in the background
+EXPOSURE_MODES = ("auto", "sport")
+EXPOSURE_LABELS = {"auto": "Auto Exposure", "sport": "Fast Sport Shutter (Max FPS)"}
+SPORT_EXPOSURE = -5             # DirectShow/MSMF log2 seconds: -5 = 1/32 s (-6 = 1/64 s for 60 fps in bright halls)
+DARK_LUMA = 65                  # sport mode: lift gain (then software gamma) while the mean frame luminance is below this
+F12_KEYS = (0x7B0000, 65481)    # cv2.waitKeyEx code of F12 on Windows / GTK
 MAX_PLAYER_SPEED_MS = 8.5       # physical cap for sprinting padel players
 HEAT_CELL_M = 0.5               # heatmap resolution (20 x 40 cells over the 10 x 20 m court)
 FOOT_PIXEL_SIGMA = 10.0         # foot-point jitter (px; far feet are often cut by the net band) -> metres via local homography scale
@@ -111,7 +120,7 @@ def log(msg):
 @dataclass
 class SourceSpec:
     source: object                 # int (webcam index) or str (URL / file path)
-    kind: str                      # "webcam" | "stream" | "file" | "youtube"
+    kind: str                      # "webcam" | "stream" | "file" | "youtube" | "mobile" (QR-paired phone)
     label: str = ""
     api_candidates: list = field(default_factory=lambda: [cv2.CAP_ANY])
     page_url: str = ""             # YouTube page URL (re-resolved with yt-dlp on reconnect)
@@ -446,6 +455,9 @@ def resolve_source(source_arg, esp32_ip=None, video=None, backend="auto"):
 
     if low in ("sim", "simulate", "simulated", "test", "file", "video"):
         return file_spec()
+    if low in MOBILE_SOURCE_NAMES:
+        # Frames are pushed by the phone over WSS (padeliq_mobile_bridge.MobileCamera) - nothing to open here.
+        return SourceSpec("mobile", "mobile", "MOBILE QR CAMERA")
     if low in WEBCAM_SOURCE_NAMES:
         idx, name, apis = find_best_webcam(backends)
         if idx is None:
@@ -503,7 +515,7 @@ class ThreadedLiveCamera:
     """
 
     def __init__(self, source, stall_timeout=STALL_TIMEOUT_S, open_timeout=6.0,
-                 cam_width=None, cam_height=None, cam_fps=None):
+                 cam_width=None, cam_height=None, cam_fps=None, exposure="auto", sport_exposure=SPORT_EXPOSURE):
         if isinstance(source, SourceSpec):
             spec = source
         else:
@@ -514,7 +526,19 @@ class ThreadedLiveCamera:
         self.source = spec.source
         self.kind = spec.kind
         self.stall_timeout = float(stall_timeout)
+        if self.kind == "webcam":
+            self.stall_timeout = min(self.stall_timeout, WEBCAM_STALL_S)
         self.open_timeout = float(open_timeout)
+        # Exposure control (webcams). Applied by the reader thread right after (re)connecting and on every toggle.
+        self.exposure_mode = exposure if exposure in EXPOSURE_MODES else "auto"
+        self.sport_exposure = float(sport_exposure)
+        self.exposure_info = {"mode": self.exposure_mode, "label": EXPOSURE_LABELS[self.exposure_mode]}
+        self._exp_dirty = True
+        self._exp_saved = None
+        self._gain_maxed = False
+        self._gamma_lut = None
+        self._last_luma_t = 0.0
+        self._settings_req = False
         self.cam_width, self.cam_height = cam_width, cam_height
         self.cam_fps = cam_fps
         self.mode = ""                      # negotiated webcam mode, e.g. "DirectShow MJPG 1280x720@60"
@@ -624,8 +648,86 @@ class ThreadedLiveCamera:
             self.spec.webcam_profile = profile
             if profile != cached:
                 save_webcam_profile(key, profile)
+            self._exp_dirty = True                        # re-apply the exposure mode on every (re)connect
             return cap, frame
         return None, None
+
+    # ---------------------------------------------------------------- exposure
+    def set_exposure_mode(self, mode):
+        """'auto' | 'sport' - switched live by the reader thread, no camera restart."""
+        if mode not in EXPOSURE_MODES:
+            raise ValueError(f"exposure mode must be one of {EXPOSURE_MODES}")
+        self.exposure_mode = mode
+        self._exp_dirty = True
+        return mode
+
+    def toggle_exposure(self):
+        return self.set_exposure_mode("sport" if self.exposure_mode == "auto" else "auto")
+
+    def open_driver_settings(self):
+        """DirectShow property sheet of the camera (Power Line Frequency 50/60 Hz, white balance, ...)."""
+        self._settings_req = True
+
+    @property
+    def exposure_label(self):
+        return EXPOSURE_LABELS[self.exposure_mode]
+
+    def _auto_exposure_values(self):
+        """(manual, auto) values of CAP_PROP_AUTO_EXPOSURE for the active backend."""
+        if self.active_api == getattr(cv2, "CAP_V4L2", -1):
+            return 1.0, 3.0                               # V4L2_EXPOSURE_MANUAL / APERTURE_PRIORITY
+        return 0.0, 1.0                                   # DirectShow / MSMF: 1 = auto, anything else = manual
+
+    def _apply_exposure(self, cap):
+        P = cv2
+        manual, auto = self._auto_exposure_values()
+        res = {}
+        try:
+            if self.exposure_mode == "sport":
+                if self._exp_saved is None:
+                    self._exp_saved = {"gain": cap.get(P.CAP_PROP_GAIN), "backlight": cap.get(P.CAP_PROP_BACKLIGHT),
+                                       "exposure": cap.get(P.CAP_PROP_EXPOSURE)}
+                res["auto_exposure_off"] = bool(cap.set(P.CAP_PROP_AUTO_EXPOSURE, manual))
+                res["exposure"] = bool(cap.set(P.CAP_PROP_EXPOSURE, self.sport_exposure))
+                res["backlight_off"] = bool(cap.set(P.CAP_PROP_BACKLIGHT, 0))
+                self._gain_maxed = False
+                self._last_luma_t = 0.0
+            else:
+                res["auto_exposure_on"] = bool(cap.set(P.CAP_PROP_AUTO_EXPOSURE, auto))
+                sv = self._exp_saved or {}
+                for k, prop in (("gain", P.CAP_PROP_GAIN), ("backlight", P.CAP_PROP_BACKLIGHT)):
+                    if sv.get(k) not in (None, -1.0):
+                        res[f"{k}_restored"] = bool(cap.set(prop, sv[k]))
+                self._gamma_lut = None
+        except cv2.error as exc:
+            res["error"] = str(exc)
+        self.exposure_info = {"mode": self.exposure_mode, "label": self.exposure_label, "applied": res,
+                              "exposure": round(float(cap.get(P.CAP_PROP_EXPOSURE)), 2),
+                              "gain": round(float(cap.get(P.CAP_PROP_GAIN)), 2), "software_gamma": False}
+        log(f"Camera exposure -> {self.exposure_label} ("
+            + ", ".join(f"{k}={'ok' if v is True else ('unsupported' if v is False else v)}" for k, v in res.items()) + ")")
+
+    def _auto_gain(self, cap, frame):
+        """Sport shutter in a dark hall: step the hardware gain up; if the driver refuses, lift with a gamma LUT."""
+        sm = frame[::16, ::16]
+        luma = float(0.114 * sm[..., 0].mean() + 0.587 * sm[..., 1].mean() + 0.299 * sm[..., 2].mean())
+        self.exposure_info["luma"] = round(luma, 1)
+        if luma < DARK_LUMA:
+            if not self._gain_maxed:
+                g = cap.get(cv2.CAP_PROP_GAIN)
+                ok = cap.set(cv2.CAP_PROP_GAIN, g + 16)
+                g2 = cap.get(cv2.CAP_PROP_GAIN)
+                if ok and g2 > g:
+                    self.exposure_info["gain"] = round(float(g2), 2)
+                    return
+                self._gain_maxed = True
+            if self._gamma_lut is None:
+                self._gamma_lut = np.array([((i / 255.0) ** (1 / 1.6)) * 255 for i in range(256)], np.uint8)
+                self.exposure_info["software_gamma"] = True
+                log(f"Sport shutter: frame luminance {luma:.0f} < {DARK_LUMA} and no more hardware gain -> software gamma lift")
+        elif luma > DARK_LUMA + 45 and self._gamma_lut is not None:
+            self._gamma_lut = None
+            self.exposure_info["software_gamma"] = False
 
     # ---------------------------------------------------------------- publish
     def _publish(self, frame):
@@ -648,12 +750,29 @@ class ThreadedLiveCamera:
             period = 1.0 / self.native_fps if (self.loopable and self.native_fps) else 0.0
             next_t = time.perf_counter() + period
             fails = 0
+            webcam = self.kind == "webcam"
             while self.running and self._gen == gen:
+                if webcam:
+                    if self._exp_dirty:
+                        self._exp_dirty = False
+                        self._apply_exposure(cap)
+                    if self._settings_req:
+                        self._settings_req = False
+                        ok_dlg = bool(cap.set(cv2.CAP_PROP_SETTINGS, 1))
+                        log("Camera driver settings dialog " + ("opened (set Power Line Frequency to 50 Hz here)"
+                                                                 if ok_dlg else "is not supported by this backend"))
                 ok, frame = cap.read()
                 if self._gen != gen or not self.running:
                     break
                 if ok and frame is not None and frame.size > 0:
                     fails = 0
+                    if webcam and self.exposure_mode == "sport":
+                        now = time.time()
+                        if now - self._last_luma_t > 0.5:
+                            self._last_luma_t = now
+                            self._auto_gain(cap, frame)
+                        if self._gamma_lut is not None:
+                            frame = cv2.LUT(frame, self._gamma_lut)
                     self._publish(frame)
                     if period:
                         delay = next_t - time.perf_counter()
@@ -819,6 +938,8 @@ def calibration_files_for(kind):
     """(save_path, [load candidates]) — the simulated video and live cameras keep separate calibrations."""
     if kind == "file":
         return SIM_CALIBRATION_FILE, [SIM_CALIBRATION_FILE]   # court_calibration.json belonged to the old annotated clip
+    if kind == "mobile":
+        return MOBILE_CALIBRATION_FILE, [MOBILE_CALIBRATION_FILE]
     return LIVE_CALIBRATION_FILE, [LIVE_CALIBRATION_FILE]
 
 
@@ -1354,6 +1475,17 @@ class CalibrationReview:
             self.touched, self.drag_idx, self.confirmed_by = False, None, None
             self.version += 1
 
+    def restore(self, corners, info, frame_shape):
+        """Re-instate a previously confirmed calibration (F12 source swap back to this camera)."""
+        with self.lock:
+            self.generation += 1
+            self.frame_shape = frame_shape
+            self._set_corners(corners)
+            self.info = dict(info or {})
+            self.state, self.error = "confirmed", ""
+            self.touched, self.drag_idx = False, None
+            self.confirmed_by = self.info.get("confirmed_by", "restored")
+
     def _set_corners(self, corners):
         self.corners = np.asarray(corners, dtype=np.float32)
         self.version += 1
@@ -1505,6 +1637,36 @@ class CalibrationReview:
 # =====================================================================
 # 5. Real-time tracking & analytics
 # =====================================================================
+class OneEuroFilter:
+    """One-Euro filter (Casiez et al. 2012) on a vector: strong smoothing while still (no jitter on the big screen),
+    the cutoff rises with speed so fast movement keeps a low lag."""
+
+    def __init__(self, min_cutoff=1.2, beta=0.012, d_cutoff=1.0):
+        self.min_cutoff, self.beta, self.d_cutoff = min_cutoff, beta, d_cutoff
+        self.x = None
+        self.dx = None
+
+    @staticmethod
+    def _alpha(cutoff, dt):
+        tau = 1.0 / (2.0 * math.pi * cutoff)
+        return 1.0 / (1.0 + tau / dt)
+
+    def reset(self):
+        self.x = self.dx = None
+
+    def __call__(self, x, dt):
+        x = np.asarray(x, dtype=np.float32)
+        if self.x is None:
+            self.x, self.dx = x.copy(), np.zeros_like(x)
+            return self.x.copy()
+        dt = max(1e-3, float(dt))
+        a_d = self._alpha(self.d_cutoff, dt)
+        self.dx = a_d * (x - self.x) / dt + (1 - a_d) * self.dx
+        a = self._alpha(self.min_cutoff + self.beta * np.abs(self.dx), dt)
+        self.x = a * x + (1 - a) * self.x
+        return self.x.copy()
+
+
 class LivePlayerState:
     def __init__(self, slot_id, default_pos_m):
         self.slot_id = slot_id
@@ -1527,6 +1689,7 @@ class LivePlayerState:
         self.aspect_ratios = deque(maxlen=25)
         self.stability_pct = 92.0
         self.bbox_vel = np.zeros(4, dtype=np.float32)      # px/s, for render-time prediction
+        self.bbox_filter = OneEuroFilter()
         self.kf_x = None                                    # Kalman state [x, y, vx, vy] in metres
         self.kf_P = None
         self.last_seen_prev = 0.0
@@ -1570,11 +1733,12 @@ class LivePlayerState:
         self.last_seen_prev = self.last_seen_time
         bbox_arr = np.array(bbox, dtype=np.float32)
         if self.bbox is None or (now - self.last_seen_time) > 1.2:
-            self.bbox = bbox_arr
+            self.bbox_filter.reset()
+            self.bbox = self.bbox_filter(bbox_arr, dt)
             self.bbox_vel[:] = 0.0
             self.pixel_trail.clear()
         else:
-            new_bbox = 0.55 * bbox_arr + 0.45 * self.bbox
+            new_bbox = self.bbox_filter(bbox_arr, dt)
             vel = (new_bbox - self.bbox) / dt
             self.bbox_vel = 0.5 * self.bbox_vel + 0.5 * np.clip(vel, -2500.0, 2500.0)
             self.bbox = new_bbox
@@ -1762,21 +1926,53 @@ class LiveSlotManager:
 # 5b. Hybrid padel ball tracker
 # =====================================================================
 class PadelBallTracker:
-    """Neon ball = HSV colour AND (frame-difference motion OR Kalman-predicted trajectory), inside the
-    court volume ROI, blob area/circularity/aspect filtered, YOLO 'sports ball' (class 32) as fallback.
-    Static yellow logos and shoes are rejected (no motion, not on the predicted path, foot zones)."""
-    HSV_LO, HSV_HI = (22, 90, 120), (48, 255, 255)
-    AREA_MIN, AREA_MAX = 12, 450
-    TRAIL_LEN = 15
+    """Multi-cue padel-ball tracker. BallWorker runs it on EVERY camera frame (30-60 fps), independent of the
+    person detector:
+      1. 3-frame temporal motion mask  |I_t - I_t-1| & |I_t - I_t-2|  (court lines, wall logos and fixed LED
+         reflections never move -> rejected; the AND localises the ball at time t, without a 1-frame lag)
+      2. wide neon yellow-green HSV (H 20-55, S 65-255, V 110-255)  OR  a bright desaturated blur streak
+         (fast smashes wash the colour out), both only inside the motion mask and the court + air ROI
+      3. player exclusion: shoes (ankle keypoints 15/16) and bodies, except around the wrists / racket
+         (keypoints 9/10) or on a fast ongoing track
+      4. cv2.KalmanFilter(4, 2) + parabola gate (x linear, y quadratic over the last measurements); candidates
+         are scored by distance to the prediction and compactness; up to COAST_FRAMES predicted frames bridge
+         net / player occlusions.
+    Speed is measured on the court plane (homography, ground scale at the nearest player's depth), clamped to
+    15-140 km/h and EMA-smoothed. Direction reversals near a wrist / player = shot; elsewhere bounce / glass."""
+    HSV_LO, HSV_HI = (20, 65, 110), (55, 255, 255)
+    STREAK_LO, STREAK_HI = (0, 0, 205), (180, 70, 255)
+    AREA_MIN, AREA_MAX = 8, 550
+    TRAIL_LEN = 18
+    COAST_FRAMES = 6
+    MOTION_T = 12
+    SPEED_MIN_KMH, SPEED_MAX_KMH = 15.0, 140.0
+    SPEED_EMA = 0.35
+    EVENT_TTL = 0.45
+    FAST_PX_S = 300.0
+    CONFIRM_PX_S = 250.0           # a track is shown only once it has moved at ball speed
+    BALL_TO_PLAYER = 0.10          # max ball diameter / height of the nearest player (ball 6.5 cm vs ~1.8 m)
 
     def __init__(self):
         self.reset()
 
     def reset(self):
+        """Full reset including court geometry (new calibration / new scene)."""
+        self.H = None
+        self.roi = None
+        self.roi_rect = None
+        self.frames = 0
+        self.frames_visible = 0
+        self.frames_measured = 0
+        self.total_shots = 0
+        self.reset_track()
+
+    def reset_track(self):
+        """Forget the current ball track and motion history, keep the court geometry and session counters."""
         self.kf = None
-        self.prev_gray = None
+        self._grays = deque(maxlen=2)
         self.last_ts = None
         self.hits = 0
+        self.misses = 0
         self.last_seen = 0.0
         self.pos = None
         self.court_pos = None
@@ -1784,27 +1980,29 @@ class PadelBallTracker:
         self.court_trail = deque(maxlen=25)
         self.speed_kmh = 0.0
         self._spd = deque(maxlen=5)
+        self._spd_ema = None
         self.vel = (0.0, 0.0)
         self.shots = 0
-        self.total_shots = 0
-        self._vy = deque(maxlen=4)
         self._last_shot = 0.0
         self.visible = False
-        self.roi = None
-        self.H = None
-        self.frames = 0
-        self.frames_visible = 0
-        self.hitter = None
+        self.coasting = False
         self.slow_since = None
         self.suppress = []                 # (x, y, until_ts) spots where slow false tracks were dropped
-        self._last_dir = 0
-        self._last_dir_t = 0.0
+        self._hist = deque(maxlen=12)      # measured (ts, x, y) of the current track
+        self._last_event_t = 0.0
+        self._track_end = None             # (ts, x, y, vx, vy) when the previous track was dropped
+        self.events = deque(maxlen=8)      # (x, y, ts, kind) kind = hit | bounce | wall
+        self.hitter = None
+        self._vmax = 0.0
 
+    # ------------------------------------------------------------------ geometry
     def set_geometry(self, H_i2c, frame_shape):
         """Court-volume ROI: the court polygon plus the space above it (lobs / smashes)."""
         self.H = H_i2c
         h, w = frame_shape[:2]
         self.roi = None
+        self.roi_rect = None
+        self._grays.clear()
         if H_i2c is None:
             return
         try:
@@ -1827,10 +2025,24 @@ class PadelBallTracker:
             hull = cv2.convexHull(np.vstack([pts, up]).astype(np.int32))
             roi = np.zeros((h, w), np.uint8)
             cv2.fillConvexPoly(roi, hull, 255)
+            x, y, bw, bh = cv2.boundingRect(hull)
+            x, y = max(0, x), max(0, y)
             self.roi = roi
+            self.roi_rect = (x, y, min(w, x + bw), min(h, y + bh))
         except Exception:
             self.roi = None
+            self.roi_rect = None
 
+    def _px_to_m_scale(self, x, y):
+        if self.H is None:
+            return None
+        try:
+            a, b = cv2.perspectiveTransform(np.array([[[x, y], [x + 1.0, y]]], np.float32), self.H)[0]
+            return float(np.linalg.norm(b - a))
+        except cv2.error:
+            return None
+
+    # ------------------------------------------------------------------ filters
     def _kf_new(self, x, y):
         kf = cv2.KalmanFilter(4, 2)
         kf.measurementMatrix = np.array([[1, 0, 0, 0], [0, 1, 0, 0]], np.float32)
@@ -1842,103 +2054,197 @@ class PadelBallTracker:
         kf.errorCovPre = kf.errorCovPost.copy()
         return kf
 
-    def _px_to_m_scale(self, x, y):
-        if self.H is None:
+    def _parabola_pred(self, ts):
+        """Ballistic prediction: x(t) linear, y(t) quadratic over the last <= 8 measurements (<= 0.3 s)."""
+        pts = [p for p in self._hist if ts - p[0] < 0.3][-8:]
+        if len(pts) < 5:
             return None
+        a = np.array(pts, np.float64)
+        t = a[:, 0] - a[-1, 0]
         try:
-            a, b = cv2.perspectiveTransform(np.array([[[x, y], [x + 1.0, y]]], np.float32), self.H)[0]
-            return float(np.linalg.norm(b - a))
-        except cv2.error:
+            px = np.polyfit(t, a[:, 1], 1)
+            py = np.polyfit(t, a[:, 2], 2)
+        except (np.linalg.LinAlgError, ValueError):
             return None
+        res = np.sqrt(np.mean((np.polyval(px, t) - a[:, 1]) ** 2 + (np.polyval(py, t) - a[:, 2]) ** 2))
+        if res > 6.0:
+            return None                                   # not a clean flight (bounce / hit inside the window)
+        tq = ts - a[-1, 0]
+        return float(np.polyval(px, tq)), float(np.polyval(py, tq))
 
-    def update(self, frame, ts, player_boxes=(), yolo_balls=()):
+    # ------------------------------------------------------------------ player logic
+    @staticmethod
+    def _kp(kps, i, j):
+        if kps is None or i >= len(kps) or kps[i] is None:
+            return None
+        k = kps[i]
+        if len(k) <= j or k[j, 2] < KCONF:
+            return None
+        return float(k[j, 0]), float(k[j, 1])
+
+    def _near_wrist(self, x, y, boxes, kps, frac=0.45):
+        for i, b in enumerate(boxes):
+            bh = max(1.0, b[3] - b[1])
+            for j in (9, 10):
+                p = self._kp(kps, i, j)
+                if p is not None and math.hypot(x - p[0], y - p[1]) < min(frac * bh, 140.0):
+                    return True
+        return False
+
+    def _near_player(self, x, y, boxes, kps):
+        """Ball at a racket: near a wrist keypoint, or (no keypoints) in the upper part of a widened player box."""
+        if self._near_wrist(x, y, boxes, kps, 0.55):
+            return True
+        for i, b in enumerate(boxes):
+            if kps is not None and i < len(kps) and kps[i] is not None:
+                continue
+            bw, bh = b[2] - b[0], b[3] - b[1]
+            if b[0] - 0.4 * bw <= x <= b[2] + 0.4 * bw and b[1] - 0.35 * bh <= y <= b[1] + 0.75 * bh:
+                return True
+        return False
+
+    def _veto(self, x, y, near, fast, strong, boxes, kps, outsiders):
+        """True when a candidate sits on a player (shoe / body) and is not explained by a racket hit or a
+        fast ongoing track."""
+        free = near and fast
+        if any(b[0] - 6 <= x <= b[2] + 6 and b[1] - 6 <= y <= b[3] + 6 for b in outsiders):
+            return True                                   # spectator / neighbouring-court player
+        for i, b in enumerate(boxes):
+            bw, bh = max(1.0, b[2] - b[0]), max(1.0, b[3] - b[1])
+            ankles = [p for p in (self._kp(kps, i, 15), self._kp(kps, i, 16)) if p is not None]
+            if ankles:
+                r = max(10.0, 0.11 * bh)
+                if any(math.hypot(x - p[0], y - p[1]) < r for p in ankles) and not free:
+                    return True                           # neon shoes
+            elif b[0] - 10 <= x <= b[2] + 10 and b[3] - 0.30 * bh <= y <= b[3] + 10 and not free:
+                return True
+            if b[0] <= x <= b[2] and b[1] <= y <= b[3]:
+                if free:
+                    continue
+                if strong and self._near_wrist(x, y, [b], [kps[i]] if kps is not None and i < len(kps) else None):
+                    continue                              # ball entering / leaving the racket at speed
+                return True                               # clothing / skin / racket frame on the body
+        return False
+
+    # ------------------------------------------------------------------ main step
+    def update(self, frame, ts, player_boxes=(), yolo_balls=(), keypoints=None, det_ts=None):
         self.frames += 1
         h, w = frame.shape[:2]
-        gray = cv2.GaussianBlur(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), (3, 3), 0)
+        boxes = [np.asarray(b, np.float32) for b in (player_boxes if player_boxes is not None else [])]
+        kps = keypoints if keypoints is not None and len(keypoints) == len(boxes) else None
+        if self.roi_rect is not None and self.roi is not None and self.roi.shape == (h, w):
+            x0, y0, x1, y1 = self.roi_rect
+        else:
+            x0, y0, x1, y1 = 0, 0, w, h
+        crop = frame[y0:y1, x0:x1]
+        gray = cv2.GaussianBlur(cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY), (3, 3), 0)
         dt = 1 / 30.0 if self.last_ts is None else float(np.clip(ts - self.last_ts, 1 / 240.0, 0.5))
         self.last_ts = ts
-        pred = None
-        tracking = self.kf is not None and ts - self.last_seen < 0.45
+
+        tracking = self.kf is not None
+        preds = []
         if tracking:
             self.kf.transitionMatrix = np.array([[1, 0, dt, 0], [0, 1, 0, dt], [0, 0, 1, 0], [0, 0, 0, 1]], np.float32)
             p = self.kf.predict()
-            pred = (float(p[0, 0]), float(p[1, 0]))
-        gate = min(260.0, 30.0 + 1600.0 * dt)
+            preds.append((float(p[0, 0]), float(p[1, 0])))
+            par = self._parabola_pred(ts)
+            if par is not None:
+                preds.append(par)
+        gate = min(260.0, 30.0 + 1600.0 * dt) * (1.0 + 0.35 * self.misses)
+        fast = self._track_speed() > self.FAST_PX_S
 
-        # people standing outside the court (spectators, adjacent courts) wear neon too: ignore their boxes
+        def pred_dist(cx, cy):
+            return min((math.hypot(cx - px, cy - py) for px, py in preds), default=1e9)
+
         outsiders = []
-        if self.H is not None and len(player_boxes):
+        if self.H is not None and boxes:
             try:
-                feet = np.array([[[(b[0] + b[2]) / 2.0, b[3]] for b in player_boxes]], np.float32)
-                for b, g in zip(player_boxes, cv2.perspectiveTransform(feet, self.H)[0]):
+                feet = np.array([[[(b[0] + b[2]) / 2.0, b[3]] for b in boxes]], np.float32)
+                for b, g in zip(boxes, cv2.perspectiveTransform(feet, self.H)[0]):
                     if not (-0.6 <= g[0] <= COURT_WIDTH_M + 0.6 and -0.6 <= g[1] <= COURT_LENGTH_M + 0.6):
                         outsiders.append(b)
             except cv2.error:
                 pass
-        cands = []
-        if self.prev_gray is not None and self.prev_gray.shape == gray.shape:
-            motion = cv2.dilate((cv2.absdiff(gray, self.prev_gray) > 15).astype(np.uint8), None, iterations=2)
-            color = cv2.inRange(cv2.cvtColor(frame, cv2.COLOR_BGR2HSV), self.HSV_LO, self.HSV_HI)
-            if self.roi is not None and self.roi.shape == color.shape:
-                color = cv2.bitwise_and(color, self.roi)
-            cnts, _ = cv2.findContours(color, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            for c in cnts:
-                area = cv2.contourArea(c)
-                if not (self.AREA_MIN <= area <= self.AREA_MAX):
-                    continue
-                x, y, bw, bh = cv2.boundingRect(c)
-                if max(bw, bh) > 3.5 * max(1, min(bw, bh)) + 1:
-                    continue
-                per = cv2.arcLength(c, True)
-                circ = 4 * math.pi * area / (per * per) if per > 0 else 0
-                if area >= 25 and circ < 0.45:
-                    continue
-                cx, cy = x + bw / 2.0, y + bh / 2.0
-                mfrac = float(motion[y:y + bh, x:x + bw].mean())
-                near_pred = pred is not None and math.hypot(cx - pred[0], cy - pred[1]) < gate
-                moving = mfrac > 0.3
-                if not (moving or (near_pred and mfrac > 0.1)):
-                    continue                              # static logo / paint / resting ball / still clothing
-                in_foot = any(b[0] - 10 <= cx <= b[2] + 10 and b[3] - 0.30 * (b[3] - b[1]) <= cy <= b[3] + 10
-                              for b in player_boxes)
-                if in_foot and not (near_pred and self._track_speed() > 350):
-                    continue                              # neon shoes (unless a fast ball is passing)
-                if any(b[0] - 6 <= cx <= b[2] + 6 and b[1] - 6 <= cy <= b[3] + 6 for b in outsiders):
-                    continue                              # spectator / neighbouring-court player
-                if any(math.hypot(cx - zx, cy - zy) < 28 and ts < zt for zx, zy, zt in self.suppress) and                         not (near_pred and self._track_speed() > 350):
-                    continue                              # learned static/slow false-positive spot
-                in_body = any(b[0] <= cx <= b[2] and b[1] + 0.15 * (b[3] - b[1]) <= cy <= b[3] for b in player_boxes)
-                if in_body and not near_pred and area > 160:
-                    continue                              # big neon clothing patch
-                cands.append((cx, cy, area, circ, moving))
-        for b in yolo_balls:                              # YOLO class 32 fallback
-            cx, cy = (b[0] + b[2]) / 2.0, (b[1] + b[3]) / 2.0
-            cands.append((cx, cy, 40.0, 0.8, True))
-        self.prev_gray = gray
 
+        cands = []
+        if len(self._grays) == 2 and self._grays[0].shape == gray.shape and self._grays[1].shape == gray.shape:
+            g1, g2 = self._grays[0], self._grays[1]
+            _, m1 = cv2.threshold(cv2.absdiff(gray, g1), self.MOTION_T, 255, cv2.THRESH_BINARY)
+            _, m2 = cv2.threshold(cv2.absdiff(gray, g2), self.MOTION_T, 255, cv2.THRESH_BINARY)
+            motion3 = cv2.bitwise_and(m1, m2)
+            md = cv2.dilate(motion3, None, iterations=2)
+            hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+            color = cv2.inRange(hsv, self.HSV_LO, self.HSV_HI)
+            streak = cv2.bitwise_and(cv2.inRange(hsv, self.STREAK_LO, self.STREAK_HI), motion3)
+            cmask = cv2.bitwise_or(cv2.bitwise_and(color, md), streak)
+            roi_c = self.roi[y0:y1, x0:x1] if self.roi_rect is not None and self.roi is not None \
+                and self.roi.shape == (h, w) else None
+            if roi_c is not None:
+                cmask = cv2.bitwise_and(cmask, roi_c)
+            cands += self._blobs(cmask, color, motion3, x0, y0, pred_dist, gate, fast, boxes, kps, outsiders, ts)
+            # Rescue: slow ball near the apex / half-hidden -> colour-only blob right on the predicted path
+            if tracking and not any(c[5] for c in cands) and preds:
+                px, py = preds[-1]
+                r = int(gate * 0.6) + 6
+                wx1, wy1 = int(max(0, px - x0 - r)), int(max(0, py - y0 - r))
+                wx2, wy2 = int(min(x1 - x0, px - x0 + r)), int(min(y1 - y0, py - y0 + r))
+                if wx2 - wx1 > 4 and wy2 - wy1 > 4:
+                    win = color[wy1:wy2, wx1:wx2].copy()
+                    if roi_c is not None:
+                        win = cv2.bitwise_and(win, roi_c[wy1:wy2, wx1:wx2])
+                    mwin = cv2.dilate(m1[wy1:wy2, wx1:wx2], None, iterations=1)
+                    cands += [c[:6] + (True,) + c[7:] for c in
+                              self._blobs(win, win, mwin, x0 + wx1, y0 + wy1, pred_dist, gate * 0.6, fast, boxes,
+                                          kps, outsiders, ts, min_motion=0.05)]
+        self._grays.appendleft(gray)
+        fresh_yolo = det_ts is None or abs(ts - det_ts) < 0.02
+        if fresh_yolo:
+            for b in (yolo_balls if yolo_balls is not None else []):
+                cx, cy = (b[0] + b[2]) / 2.0, (b[1] + b[3]) / 2.0
+                d = pred_dist(cx, cy)
+                cands.append((cx, cy, 40.0, 0.8, 1.0, d < gate, False, False, False))
+
+        # ---------------------------------------------------------- association
         meas = None
-        if pred is not None:
+        if tracking:
             best = None
-            for cx, cy, area, circ, moving in cands:
-                d = math.hypot(cx - pred[0], cy - pred[1])
-                if d < gate and (best is None or d < best[0]):
-                    best = (d, cx, cy)
+            for cx, cy, area, circ, mfrac, near, weak, streak, inbox in cands:
+                d = pred_dist(cx, cy)
+                if d >= gate:
+                    continue
+                score = d / gate + 0.25 * (1.0 - min(1.0, circ)) + (0.2 if weak else 0.0)
+                if best is None or score < best[0]:
+                    best = (score, cx, cy)
             if best:
                 meas = (best[1], best[2])
-        if meas is None and cands and not (tracking and self.hits >= 3):
-            moving = [c for c in cands if c[4]]
-            if moving:
-                cx, cy, *_ = max(moving, key=lambda c: c[3] + 0.002 * min(c[2], 120))
-                self.kf, self.hits, meas = self._kf_new(cx, cy), 0, (cx, cy)
+        if meas is None and not (tracking and self.hits >= 3 and self.misses < self.COAST_FRAMES):
+            # a new track only starts from a compact, clearly moving yellow blob away from the players
+            strong = [c for c in cands if c[4] > 0.3 and not c[6] and not c[7] and not c[8] and c[3] >= 0.5]
+            if strong:
+                cx, cy, *_ = max(strong, key=lambda c: c[3] + 0.002 * min(c[2], 120) + 0.3 * c[4])
+                if self.kf is not None and self.hits >= 3:
+                    self._end_track(ts)
+                self.kf, self.hits, self.misses, meas = self._kf_new(cx, cy), 0, 0, (cx, cy)
                 self.trail.clear()
-                self._vy.clear()
+                self.court_trail.clear()
+                self._hist.clear()
+                self.slow_since = None
+                self._vmax = 0.0
+                tracking = True
+
         if meas is not None:
             st = self.kf.correct(np.array([[meas[0]], [meas[1]]], np.float32))
             self.hits += 1
+            self.misses = 0
+            self.coasting = False
             self.last_seen = ts
             self.pos = meas
+            self.frames_measured += 1
             vx, vy = float(st[2, 0]), float(st[3, 0])
             self.vel = (vx, vy)
+            self._hist.append((ts, meas[0], meas[1]))
+            if self.hits >= 3:
+                self._vmax = max(self._vmax, math.hypot(vx, vy))
             # a padel ball in play is never slow for long: drop tracks that crawl (shoes, debris, resting ball)
             if self.hits >= 3 and math.hypot(vx, vy) < 150:
                 self.slow_since = self.slow_since or ts
@@ -1948,22 +2254,141 @@ class PadelBallTracker:
                 self.suppress = [z for z in self.suppress if z[2] > ts][-30:] + [(meas[0], meas[1], ts + 10.0)]
                 self.kf, self.hits, self.slow_since = None, 0, None
                 self.trail.clear()
+                self._hist.clear()
                 self.visible = False
                 return False
-            if self.hits >= 1:
-                self.trail.append((int(meas[0]), int(meas[1])))
-                self._update_speed(meas, vx, vy, player_boxes)
-                self._update_court(meas, player_boxes)
-                self._update_shots(vy, ts, player_boxes)
+            self.trail.append((int(meas[0]), int(meas[1])))
+            self._update_speed(meas, vx, vy, boxes)
+            self._update_court(meas, boxes)
+            if self.hits == 4:
+                self._new_track_event(ts, boxes, kps)
+            self._detect_event(ts, boxes, kps)
+        elif self.kf is not None:
+            self.misses += 1
+            if self.misses > self.COAST_FRAMES or ts - self.last_seen > 0.35 or self.hits < 3:
+                self._end_track(ts)
+            else:                                         # coast on the prediction through a short occlusion
+                st = self.kf.statePost
+                self.pos = (float(st[0, 0]), float(st[1, 0]))
+                self.coasting = True
+                if 0 <= self.pos[0] < w and 0 <= self.pos[1] < h:
+                    self.trail.append((int(self.pos[0]), int(self.pos[1])))
+                    self._update_court(self.pos, boxes)
+                else:
+                    self._end_track(ts)
         if ts - self.last_seen > 4.0 and self.shots:
             self.shots = 0                                # ball gone for a while -> next rally
-        self.visible = (self.kf is not None and self.hits >= 3 and ts - self.last_seen < 0.2
-                        and self.slow_since is None)
+        self.visible = (self.kf is not None and self.hits >= 3 and self.misses <= self.COAST_FRAMES
+                        and self.slow_since is None and self._vmax >= self.CONFIRM_PX_S)
         if self.visible:
             self.frames_visible += 1
         elif ts - self.last_seen > 0.5:
             self.trail.clear()
+            self.coasting = False
         return self.visible
+
+    def _blobs(self, mask, color, motion, ox, oy, pred_dist, gate, fast, boxes, kps, outsiders, ts, min_motion=0.25):
+        out = []
+        cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        for c in cnts:
+            area = cv2.contourArea(c)
+            if not (self.AREA_MIN <= area <= self.AREA_MAX):
+                continue
+            x, y, bw, bh = cv2.boundingRect(c)
+            col = float(color[y:y + bh, x:x + bw].mean()) / 255.0
+            streak = col < 0.25                          # desaturated motion-blur streak, not the yellow body
+            elong = max(bw, bh) / max(1.0, min(bw, bh))
+            if elong > (7.0 if streak else 3.5) + 1.0 / max(1, min(bw, bh)):
+                continue
+            per = cv2.arcLength(c, True)
+            circ = 4 * math.pi * area / (per * per) if per > 0 else 0.0
+            if not streak and area >= 25:
+                if circ < 0.50:
+                    continue
+                hull_a = cv2.contourArea(cv2.convexHull(c))
+                if hull_a > 0 and area / hull_a < 0.82:
+                    continue                              # ragged shape: shoe / logo / clothing fragment
+            if streak and (area < 14 or elong < 1.6):
+                continue                                  # tiny white flicker / round white patch (caps, socks)
+            mfrac = float(motion[y:y + bh, x:x + bw].mean()) / 255.0
+            cx, cy = ox + x + bw / 2.0, oy + y + bh / 2.0
+            near = pred_dist(cx, cy) < gate
+            if mfrac < min_motion and not (near and mfrac > 0.08):
+                continue
+            if streak and not near:
+                continue                                  # a blur streak can extend a track, never start one
+            nb = self._nearest_box((cx, cy), boxes)
+            inbox = False
+            if nb is not None:
+                bh = max(1.0, nb[1][3] - nb[1][1])
+                if nb[0] < 0.5 * bh and not streak and math.sqrt(4.0 * area / math.pi) > max(7.0, self.BALL_TO_PLAYER * bh):
+                    continue                              # too big for a ball at this player's depth (shirt / shoe)
+                b = nb[1]
+                bw = b[2] - b[0]
+                inbox = (b[0] - 0.1 * bw <= cx <= b[2] + 0.1 * bw) and (b[1] - 0.05 * bh <= cy <= b[3] + 0.05 * bh)
+            if any(math.hypot(cx - zx, cy - zy) < 28 and ts < zt for zx, zy, zt in self.suppress) \
+                    and not (near and fast):
+                continue                                  # learned static / slow false-positive spot
+            if self._veto(cx, cy, near, fast, mfrac > 0.45, boxes, kps, outsiders):
+                continue
+            out.append((cx, cy, area, (0.55 if streak else circ), mfrac, near, False, streak, inbox))
+        return out
+
+    # ------------------------------------------------------------------ events / metrics
+    def _end_track(self, ts):
+        if self.kf is not None and self.hits >= 3 and self.pos is not None:
+            self._track_end = (ts, self.pos[0], self.pos[1], self.vel[0], self.vel[1])
+        self.kf, self.hits, self.misses = None, 0, 0
+        self.coasting = False
+        self._hist.clear()
+
+    def _classify(self, x, y, v_in, v_out, boxes, kps):
+        if self._near_player(x, y, boxes, kps):
+            return "hit"
+        return "bounce" if v_in[1] > 0 > v_out[1] else "wall"
+
+    def _add_event(self, x, y, ts, kind):
+        if ts - self._last_event_t < 0.25:
+            return
+        self._last_event_t = ts
+        self.events.append((float(x), float(y), ts, kind))
+        if kind == "hit":
+            self._register_shot(ts)
+
+    def _detect_event(self, ts, boxes, kps):
+        """Direction reversal inside one track: dot(v_prev, v_curr) < 0 (or a > ~70 deg turn)."""
+        if len(self._hist) < 7:
+            return
+        a = np.array(list(self._hist)[-7:], np.float64)
+        dt1, dt2 = a[3, 0] - a[0, 0], a[6, 0] - a[3, 0]
+        if dt1 <= 0 or dt2 <= 0:
+            return
+        v1, v2 = (a[3, 1:] - a[0, 1:]) / dt1, (a[6, 1:] - a[3, 1:]) / dt2
+        n1, n2 = np.linalg.norm(v1), np.linalg.norm(v2)
+        if min(n1, n2) < 120:
+            return
+        if float(np.dot(v1, v2)) / (n1 * n2) > 0.35:
+            return
+        x, y = a[3, 1], a[3, 2]
+        self._add_event(x, y, ts, self._classify(x, y, v1, v2, boxes, kps))
+        for _ in range(3):                                # don't re-detect the same turn
+            self._hist.popleft()
+
+    def _new_track_event(self, ts, boxes, kps):
+        """Tracks usually break at racket contact: a new track leaving the old end point the other way = impact."""
+        te = self._track_end
+        if te is None or ts - te[0] > 0.6 or len(self._hist) < 2:
+            return
+        t0, x0, y0 = self._hist[0]
+        if math.hypot(x0 - te[1], y0 - te[2]) > 180:
+            return
+        v_in = np.array([te[3], te[4]])
+        v_out = np.array(self.vel)
+        n1, n2 = np.linalg.norm(v_in), np.linalg.norm(v_out)
+        if min(n1, n2) < 120 or float(np.dot(v_in, v_out)) / (n1 * n2) > 0.35:
+            return
+        self._add_event(x0, y0, ts, self._classify(x0, y0, v_in, v_out, boxes, kps))
+        self._track_end = None
 
     def _nearest_box(self, pt, boxes):
         best = None
@@ -1976,16 +2401,22 @@ class PadelBallTracker:
         return best
 
     def _update_speed(self, pt, vx, vy, boxes):
-        # Ball height is unknown in a single camera: use the ground scale at the depth of the nearest
-        # player (the ball is usually between / near players) -> approximate speed.
+        # Ball height is unknown with one camera: use the ground-plane scale (m/px) at the depth of the nearest
+        # player (the ball is almost always between / near players) -> perspective-correct court speed.
+        if self.hits < 3:
+            return
         nb = self._nearest_box(pt, boxes)
         row = nb[1][3] if nb is not None else pt[1]
         scale = self._px_to_m_scale(pt[0], row)
         if scale is None:
             return
-        kmh = float(np.clip(math.hypot(vx, vy) * scale * 3.6, 0, 200))
+        kmh = math.hypot(vx, vy) * scale * 3.6
+        if kmh > 200:
+            return                                        # Kalman transient right after an impact
         self._spd.append(kmh)
-        self.speed_kmh = float(np.median(self._spd))
+        med = float(np.median(self._spd))
+        self._spd_ema = med if self._spd_ema is None else self.SPEED_EMA * med + (1 - self.SPEED_EMA) * self._spd_ema
+        self.speed_kmh = float(np.clip(self._spd_ema, self.SPEED_MIN_KMH, self.SPEED_MAX_KMH))
 
     def _update_court(self, pt, boxes):
         if self.H is None:
@@ -1997,7 +2428,10 @@ class PadelBallTracker:
                 if nb is None:
                     return
                 g = cv2.perspectiveTransform(np.array([[[pt[0], nb[1][3]]]], np.float32), self.H)[0][0]
-            self.court_pos = (float(np.clip(g[0], 0, COURT_WIDTH_M)), float(np.clip(g[1], 0, COURT_LENGTH_M)))
+            new = (float(np.clip(g[0], 0, COURT_WIDTH_M)), float(np.clip(g[1], 0, COURT_LENGTH_M)))
+            if self.court_trail and self.court_pos is not None:   # EMA: the in-air depth guess must not zig-zag
+                new = (0.5 * new[0] + 0.5 * self.court_pos[0], 0.5 * new[1] + 0.5 * self.court_pos[1])
+            self.court_pos = new
             self.court_trail.append(self.court_pos)
         except cv2.error:
             pass
@@ -2011,25 +2445,11 @@ class PadelBallTracker:
             self.total_shots += 1
             self._last_shot = ts
 
-    def _update_shots(self, vy, ts, boxes):
-        # (a) new fast segment heading the other way soon after the last one = a hit (track drops at contact)
-        if self.hits == 4 and abs(vy) > 120:
-            d = 1 if vy > 0 else -1
-            if self._last_dir and d != self._last_dir and ts - self._last_dir_t < 2.0:
-                self._register_shot(ts)
-        if self.hits >= 4 and abs(vy) > 120:
-            self._last_dir, self._last_dir_t = (1 if vy > 0 else -1), ts
-        # (b) direction reversal inside one continuous track
-        self._vy.append(vy)
-        if len(self._vy) < 4:
-            return
-        a, b = np.mean(list(self._vy)[:2]), np.mean(list(self._vy)[2:])
-        if a * b < 0 and min(abs(a), abs(b)) > 60:
-            self._register_shot(ts)
-            self._vy.clear()
+    def recent_events(self, now):
+        return [e for e in self.events if 0 <= now - e[2] < self.EVENT_TTL]
 
     def state(self, now=None):
-        return {"visible": bool(self.visible),
+        return {"visible": bool(self.visible), "coasting": bool(self.coasting and self.visible),
                 "image_px": None if self.pos is None or not self.visible else [round(self.pos[0], 1), round(self.pos[1], 1)],
                 "court_m": None if self.court_pos is None or not self.visible else [round(self.court_pos[0], 2), round(self.court_pos[1], 2)],
                 "court_trail_m": [[round(x, 2), round(y, 2)] for x, y in list(self.court_trail)[-15:]] if self.visible else [],
@@ -2038,8 +2458,9 @@ class PadelBallTracker:
 
 
 class BallWorker:
-    """Runs the ball tracker on every captured frame (up to max_fps) in its own thread, independent of
-    the slower person detector, so fast balls keep a dense trajectory."""
+    """Runs the ball tracker on every captured frame (up to max_fps) in its own thread, independent of the
+    slower person detector, so fast balls keep a dense trajectory. boxes_getter() -> (boxes, yolo_balls[,
+    keypoints[, detection_capture_ts]])."""
 
     def __init__(self, cam_getter, ball, boxes_getter, min_height=720, max_fps=60.0):
         self.cam_getter, self.ball, self.boxes_getter = cam_getter, ball, boxes_getter
@@ -2060,14 +2481,17 @@ class BallWorker:
                     continue
                 if cam is not last_cam:
                     last_cam, last_fid = cam, -1
-                    self.ball.reset()
+                    self.ball.reset_track()               # keep the court geometry (restored on F12 swaps)
                 frame, fid, ts = cam_wait_latest(cam, last_fid, 0.05)
                 if frame is None or fid == last_fid:
                     continue
                 last_fid = fid
                 canvas = prepare_canvas(frame, self.min_height)
-                boxes, yolo_balls = self.boxes_getter()
-                self.ball.update(canvas, ts, boxes, yolo_balls)
+                got = self.boxes_getter()
+                boxes, yolo_balls = got[0], got[1]
+                kps = got[2] if len(got) > 2 else None
+                det_ts = got[3] if len(got) > 3 else None
+                self.ball.update(canvas, ts, boxes, yolo_balls, keypoints=kps, det_ts=det_ts)
                 n += 1
                 if time.time() - t0 >= 2.0:
                     self.rate, n, t0 = n / (time.time() - t0), 0, time.time()
@@ -2159,6 +2583,74 @@ def fit_text(text, scale, thickness, max_w):
     return text.rstrip() + "..."
 
 
+# ---------------------------------------------------------------- HUD compositing primitives
+# Translucency is only ever blended on the small ROI slice under a panel / glow (never a full 1280x720 copy),
+# and panel chrome + text are pre-rendered patches: re-rendered only when their (10 Hz-throttled) content changes,
+# while boxes, skeleton trails, minimap dots and the ball comet are drawn fresh on every frame.
+HUD_TEXT_HZ = 10.0
+_HUD_SLOW = {}                      # key -> (t, value)
+_HUD_PATCH = {}                     # key -> (signature, img, mask, bg_img)
+
+
+def hud_slow(key, now, fn, hz=HUD_TEXT_HZ):
+    """fn() re-evaluated at most `hz` times per second (readable numbers, far fewer text renders)."""
+    ent = _HUD_SLOW.get(key)
+    if ent is None or now - ent[0] >= 1.0 / hz or now < ent[0]:
+        ent = (now, fn())
+        _HUD_SLOW[key] = ent
+    return ent[1]
+
+
+def hud_patch(key, sig, size, draw, bg, border=None):
+    """Pre-rendered opaque panel content: draw(img) paints on a solid `bg` canvas of `size` (w, h).
+    Cached until `sig` / size / colours change. Returns (img, mask_of_content, solid_bg)."""
+    w, h = max(1, int(size[0])), max(1, int(size[1]))
+    full_sig = (sig, w, h, tuple(bg), None if border is None else tuple(border))
+    ent = _HUD_PATCH.get(key)
+    if ent is not None and ent[0] == full_sig:
+        return ent[1:]
+    img = np.empty((h, w, 3), np.uint8)
+    img[:] = bg
+    draw(img)
+    if border is not None:
+        cv2.rectangle(img, (0, 0), (w - 1, h - 1), border, 1, cv2.LINE_AA)
+    bg_img = np.empty_like(img)
+    bg_img[:] = bg
+    mask = (cv2.absdiff(img, bg_img).max(axis=2) > 0)[:, :, None]
+    _HUD_PATCH[key] = (full_sig, img, mask, bg_img)
+    return img, mask, bg_img
+
+
+def composite_patch(frame, x1, y1, patch, alpha):
+    """roi = alpha * bg + (1 - alpha) * roi on the panel slice only, then the opaque text / line pixels."""
+    img, mask, bg_img = patch
+    ph, pw = img.shape[:2]
+    H, W = frame.shape[:2]
+    x1, y1 = int(x1), int(y1)
+    fx1, fy1, fx2, fy2 = max(0, x1), max(0, y1), min(W, x1 + pw), min(H, y1 + ph)
+    if fx2 <= fx1 or fy2 <= fy1:
+        return
+    sx1, sy1 = fx1 - x1, fy1 - y1
+    sx2, sy2 = sx1 + (fx2 - fx1), sy1 + (fy2 - fy1)
+    roi = frame[fy1:fy2, fx1:fx2]
+    cv2.addWeighted(roi, 1.0 - alpha, bg_img[sy1:sy2, sx1:sx2], alpha, 0, dst=roi)
+    np.copyto(roi, img[sy1:sy2, sx1:sx2], where=mask[sy1:sy2, sx1:sx2])
+
+
+def blend_roi(frame, rect, alpha, draw):
+    """Translucent effect on a cropped slice: draw(layer, ox, oy) paints on a copy of frame[rect] using
+    frame coordinates minus (ox, oy); the slice is then blended back in place."""
+    H, W = frame.shape[:2]
+    x1, y1 = max(0, int(rect[0])), max(0, int(rect[1]))
+    x2, y2 = min(W, int(rect[2])), min(H, int(rect[3]))
+    if x2 <= x1 or y2 <= y1:
+        return
+    roi = frame[y1:y2, x1:x2]
+    layer = roi.copy()
+    draw(layer, x1, y1)
+    cv2.addWeighted(layer, alpha, roi, 1.0 - alpha, 0, dst=roi)
+
+
 def draw_glass_box(frame, x1, y1, x2, y2, bg=(18, 18, 18), alpha=0.68, border=None):
     h, w = frame.shape[:2]
     x1, y1 = max(0, int(x1)), max(0, int(y1))
@@ -2166,8 +2658,9 @@ def draw_glass_box(frame, x1, y1, x2, y2, bg=(18, 18, 18), alpha=0.68, border=No
     if x2 <= x1 or y2 <= y1:
         return
     roi = frame[y1:y2, x1:x2]
-    overlay = np.full(roi.shape, bg, dtype=np.uint8)
-    frame[y1:y2, x1:x2] = cv2.addWeighted(overlay, alpha, roi, 1.0 - alpha, 0)
+    overlay = np.empty_like(roi)
+    overlay[:] = bg
+    cv2.addWeighted(overlay, alpha, roi, 1.0 - alpha, 0, dst=roi)
     if border is not None:
         cv2.rectangle(frame, (x1, y1), (x2 - 1, y2 - 1), border, 1, cv2.LINE_AA)
 
@@ -2205,21 +2698,52 @@ def draw_court_overlay(frame, corners_px, H, s):
             cv2.polylines(frame, [pts.astype(np.int32)], False, color, max(1, int(round(th * s))), cv2.LINE_AA)
 
 
+# ---------------------------------------------------------------- ball
+BALL_TRAIL_CYAN = np.array((255, 255, 0), np.float32)     # BGR, tail
+BALL_TRAIL_GOLD = np.array((0, 200, 255), np.float32)     # BGR, head
+
+
+def _draw_ball_icon(img, cx, cy, r):
+    """Tiny padel-ball pictogram (OpenCV fonts have no emoji)."""
+    cv2.circle(img, (cx, cy), r, (40, 240, 230), -1, cv2.LINE_AA)
+    cv2.ellipse(img, (cx - r, cy), (r, r), 0, -55, 55, (245, 245, 245), 1, cv2.LINE_AA)
+    cv2.ellipse(img, (cx + r, cy), (r, r), 0, 125, 235, (245, 245, 245), 1, cv2.LINE_AA)
+
+
+def draw_ball_impacts(frame, ball, now, s):
+    """Expanding impact rings on hits (white / gold) and bounces / glass (cyan)."""
+    if ball is None or not hasattr(ball, "recent_events"):
+        return
+    for x, y, t, kind in ball.recent_events(now):
+        a = (now - t) / ball.EVENT_TTL
+        r = int((10 + 34 * a) * s)
+        col = (80, 230, 255) if kind == "hit" else (255, 230, 60)
+        th = max(1, int(round((3.0 - 2.0 * a) * s)))
+        cx, cy = int(x), int(y)
+        blend_roi(frame, (cx - r - th - 2, cy - r - th - 2, cx + r + th + 3, cy + r + th + 3), max(0.15, 1.0 - a),
+                  lambda L, ox, oy, cx=cx, cy=cy, r=r, col=col, th=th:
+                  cv2.circle(L, (cx - ox, cy - oy), r, col, th, cv2.LINE_AA))
+
+
 def draw_ball_hud(frame, ball, now, s, obstacles=()):
-    """Glowing target ring, 15-frame comet trail and a 'BALL xx km/h | Rally shots N' tag."""
+    """Neon target ring, 18-frame tapering cyan->gold comet trail, impact rings and a non-overlapping
+    'BALL: xx km/h | Shots: N' tag. Drawn after every other layer."""
+    draw_ball_impacts(frame, ball, now, s)
     if ball is None or not ball.visible or ball.pos is None:
         return
     tr = list(ball.trail)
     n = len(tr)
     for i in range(1, n):
         a = i / max(1, n - 1)                                     # 0 = oldest -> 1 = newest
-        col = (int(255 * a), 255, int(255 * (1 - a) + 40 * a))    # cyan tail -> neon yellow head (BGR)
-        cv2.line(frame, tr[i - 1], tr[i], col, max(1, int(round((1 + 4 * a) * s))), cv2.LINE_AA)
+        col = tuple(int(v) for v in BALL_TRAIL_CYAN * (1 - a) + BALL_TRAIL_GOLD * a)
+        cv2.line(frame, tr[i - 1], tr[i], col, max(1, int(round((1 + 5 * a * a) * s))), cv2.LINE_AA)
     cx, cy = int(ball.pos[0]), int(ball.pos[1])
     r = max(8, int(11 * s))
-    glow = frame.copy()
-    cv2.circle(glow, (cx, cy), int(r * 1.9), (0, 255, 255), max(2, int(5 * s)), cv2.LINE_AA)
-    cv2.addWeighted(glow, 0.35, frame, 0.65, 0, frame)
+    coasting = bool(getattr(ball, "coasting", False))
+    gr, gth = int(r * 1.9), max(2, int(5 * s))
+    blend_roi(frame, (cx - gr - gth - 2, cy - gr - gth - 2, cx + gr + gth + 3, cy + gr + gth + 3),
+              0.25 if coasting else 0.40,
+              lambda L, ox, oy: cv2.circle(L, (cx - ox, cy - oy), gr, (0, 255, 255), gth, cv2.LINE_AA))
     pulse = 1.0 + 0.15 * math.sin(now * 10)
     cv2.circle(frame, (cx, cy), int(r * pulse), (0, 255, 255), max(2, int(2 * s)), cv2.LINE_AA)
     cv2.circle(frame, (cx, cy), int(r * 1.45), (255, 255, 0), max(1, int(1 * s)), cv2.LINE_AA)
@@ -2227,11 +2751,12 @@ def draw_ball_hud(frame, ball, now, s, obstacles=()):
         ux, uy = math.cos(math.radians(ang)), math.sin(math.radians(ang))
         cv2.line(frame, (int(cx + ux * r * 1.5), int(cy + uy * r * 1.5)), (int(cx + ux * r * 2.1), int(cy + uy * r * 2.1)),
                  (255, 255, 0), max(1, int(2 * s)), cv2.LINE_AA)
-    label = f"BALL {ball.speed_kmh:.0f} km/h | Rally shots {ball.shots}"
-    fs = 0.45 * s
+    label = hud_slow("ball_label", now, lambda: f"BALL: {ball.speed_kmh:.0f} km/h | Shots: {ball.shots}")
+    fs = 0.48 * s
     (tw, th), _ = cv2.getTextSize(label, FONT, fs, 1)
+    icon = int(th * 0.75) + 1
     h, w = frame.shape[:2]
-    tw2, th2 = tw + int(14 * s), th + int(12 * s)
+    tw2, th2 = tw + 2 * icon + int(20 * s), th + int(12 * s)
     off = int(r * 2.3)
     best = None
     for ox, oy in ((off, -off - th2), (-off - tw2, -off - th2), (off, off), (-off - tw2, off)):
@@ -2244,11 +2769,14 @@ def draw_ball_hud(frame, ball, now, s, obstacles=()):
         if cost == 0:
             break
     _, bx, by = best
-    draw_glass_box(frame, bx, by, bx + tw + int(14 * s), by + th + int(12 * s), bg=(10, 10, 10), alpha=0.82,
-                   border=(0, 255, 255))
-    put_text(frame, label, (bx + int(7 * s), by + th + int(6 * s)), fs, (0, 255, 255), 1, s)
+
+    def paint(im):
+        _draw_ball_icon(im, int(7 * s) + icon, th2 // 2, icon)
+        put_text(im, label, (int(12 * s) + 2 * icon, th + int(6 * s)), fs, (0, 255, 255), 1, s)
+    composite_patch(frame, bx, by, hud_patch("ball_label", label, (tw2, th2), paint, (10, 10, 10), (0, 255, 255)), 0.82)
 
 
+# ---------------------------------------------------------------- calibration review
 def draw_calibration_review(frame, review, now, s, web=False):
     """Glowing court model + 6 draggable handles (TL, TR, BR, BL, NET-L, NET-R) + lock banner."""
     if review is None or review.state in ("idle", "confirmed"):
@@ -2271,15 +2799,21 @@ def draw_calibration_review(frame, review, now, s, web=False):
                 [(0, NET_Y_M), (10, NET_Y_M)], [(0, SERVICE_LINE_NEAR_M), (10, SERVICE_LINE_NEAR_M)],
                 [(0, SERVICE_LINE_FAR_M), (10, SERVICE_LINE_FAR_M)],
                 [(5, SERVICE_LINE_NEAR_M), (5, SERVICE_LINE_FAR_M)]]
-        glow = frame.copy()
         polys = []
         for idx_s, (a, b) in enumerate(segs):
             pts = CG.sample_clipped_segment(H_c2i, a, b, frame.shape, steps=44)
             if pts is not None:
-                ipts = pts.astype(np.int32)
-                polys.append((idx_s, ipts))
-                cv2.polylines(glow, [ipts], False, (255, 255, 0), max(4, int(9 * s)), cv2.LINE_AA)
-        cv2.addWeighted(glow, 0.35, frame, 0.65, 0, frame)
+                polys.append((idx_s, pts.astype(np.int32)))
+        if polys:
+            allp = np.vstack([p for _, p in polys])
+            gw = max(4, int(9 * s))
+            (gx1, gy1), (gx2, gy2) = allp.min(axis=0) - gw, allp.max(axis=0) + gw + 1
+
+            def glow(L, ox, oy):
+                off = np.array([ox, oy], np.int32)
+                for _, ipts in polys:
+                    cv2.polylines(L, [ipts - off], False, (255, 255, 0), gw, cv2.LINE_AA)
+            blend_roi(frame, (gx1, gy1, gx2, gy2), 0.35, glow)
         for idx_s, ipts in polys:
             col = (255, 255, 255) if idx_s == 4 else ((80, 255, 80) if idx_s < 4 else (255, 255, 0))
             cv2.polylines(frame, [ipts], False, col, max(1, int(2 * s)), cv2.LINE_AA)
@@ -2323,16 +2857,20 @@ def draw_calibration_review(frame, review, now, s, web=False):
               "Scene-cut detector active -- press [C] for manual handles or [A] to Re-Scan")
         col = (60, 160, 255)
     fs1, fs2 = 0.56 * s, 0.44 * s
-    l1 = fit_text(l1, fs1, 2, w - 60 * s)
-    l2 = fit_text(l2, fs2, 1, w - 60 * s)
+    bw = w - int(28 * s)
+    l1 = fit_text(l1, fs1, 2, bw - int(32 * s))
+    l2 = fit_text(l2, fs2, 1, bw - int(32 * s))
     bh = int((62 if l2 else 40) * s)
-    y0 = int(10 * s)
-    draw_glass_box(frame, int(14 * s), y0, w - int(14 * s), y0 + bh, bg=(10, 10, 10), alpha=0.88, border=col)
-    put_text(frame, l1, (int(28 * s), y0 + int(26 * s)), fs1, col, 2, s)
-    if l2:
-        put_text(frame, l2, (int(28 * s), y0 + int(50 * s)), fs2, (235, 235, 235), 1, s)
+
+    def paint(im):
+        put_text(im, l1, (int(14 * s), int(26 * s)), fs1, col, 2, s)
+        if l2:
+            put_text(im, l2, (int(14 * s), int(50 * s)), fs2, (235, 235, 235), 1, s)
+    composite_patch(frame, int(14 * s), int(10 * s),
+                    hud_patch("calib_banner", (l1, l2, col), (bw, bh), paint, (10, 10, 10), col), 0.88)
 
 
+# ---------------------------------------------------------------- minimap
 def draw_minimap(frame, slot_mgr, now, s, ball=None):
     h, w = frame.shape[:2]
     m = int(16 * s)
@@ -2343,25 +2881,29 @@ def draw_minimap(frame, slot_mgr, now, s, ball=None):
     mw, mh = iw + 2 * pad, ih + 2 * pad + title_h
     mx1, my1 = w - mw - m, m
     rect = (mx1, my1, mx1 + mw, my1 + mh)
-    draw_glass_box(frame, *rect, bg=(160, 85, 30), alpha=0.80, border=(255, 255, 255))
-    put_text(frame, "2D COURT MAP", (mx1 + pad, my1 + int(18 * s)), 0.45 * s, (255, 255, 255), 1, s)
+    lx1, ly1 = pad, pad + title_h        # inner court origin, panel-local
+    line_th = max(1, int(round(1 * s)))
 
-    ix1, iy1 = mx1 + pad, my1 + pad + title_h
+    def lpx(xm, ym, ox=0, oy=0):
+        return (int(ox + lx1 + (np.clip(xm, 0, COURT_WIDTH_M) / COURT_WIDTH_M) * iw),
+                int(oy + ly1 + (np.clip(ym, 0, COURT_LENGTH_M) / COURT_LENGTH_M) * ih))
+
+    def chrome(im):                      # static court map: rendered once per size, then cached
+        put_text(im, "2D COURT MAP", (pad, int(18 * s)), 0.45 * s, (255, 255, 255), 1, s)
+        cv2.rectangle(im, (lx1, ly1), (lx1 + iw, ly1 + ih), (245, 245, 245), max(1, int(round(2 * s))), cv2.LINE_AA)
+        for ym in (SERVICE_LINE_NEAR_M, SERVICE_LINE_FAR_M):
+            cv2.line(im, lpx(0, ym), lpx(COURT_WIDTH_M, ym), (230, 230, 230), line_th, cv2.LINE_AA)
+        cv2.line(im, lpx(COURT_WIDTH_M / 2, SERVICE_LINE_NEAR_M), lpx(COURT_WIDTH_M / 2, SERVICE_LINE_FAR_M),
+                 (230, 230, 230), line_th, cv2.LINE_AA)
+        cv2.line(im, lpx(0, NET_Y_M), lpx(COURT_WIDTH_M, NET_Y_M), (255, 255, 255),
+                 max(2, int(round(3 * s))), cv2.LINE_AA)
+    composite_patch(frame, mx1, my1, hud_patch("minimap", round(s, 3), (mw, mh), chrome, (160, 85, 30), (255, 255, 255)),
+                    0.80)
+
+    ix1, iy1 = mx1 + lx1, my1 + ly1
 
     def to_px(xm, ym):
-        return (int(ix1 + (np.clip(xm, 0, COURT_WIDTH_M) / COURT_WIDTH_M) * iw),
-                int(iy1 + (np.clip(ym, 0, COURT_LENGTH_M) / COURT_LENGTH_M) * ih))
-
-    line_th = max(1, int(round(1 * s)))
-    cv2.rectangle(frame, (ix1, iy1), (ix1 + iw, iy1 + ih), (245, 245, 245), max(1, int(round(2 * s))), cv2.LINE_AA)
-    # Service lines (6.95 m from the net) and centre service divider
-    for ym in (SERVICE_LINE_NEAR_M, SERVICE_LINE_FAR_M):
-        cv2.line(frame, to_px(0, ym), to_px(COURT_WIDTH_M, ym), (230, 230, 230), line_th, cv2.LINE_AA)
-    cv2.line(frame, to_px(COURT_WIDTH_M / 2, SERVICE_LINE_NEAR_M), to_px(COURT_WIDTH_M / 2, SERVICE_LINE_FAR_M),
-             (230, 230, 230), line_th, cv2.LINE_AA)
-    # Net
-    cv2.line(frame, to_px(0, NET_Y_M), to_px(COURT_WIDTH_M, NET_Y_M), (255, 255, 255),
-             max(2, int(round(3 * s))), cv2.LINE_AA)
+        return lpx(xm, ym, mx1, my1)
 
     dot_r = max(3, int(6 * s))
     fs = 0.42 * s
@@ -2375,11 +2917,14 @@ def draw_minimap(frame, slot_mgr, now, s, ball=None):
             cv2.line(frame, m_pts[i - 1], m_pts[i], color, max(1, int(round(2 * s))), cv2.LINE_AA)
         visible.append((sid, color, m_pts[-1]))
 
-    # Dots first, then labels placed so they avoid every dot and every other label.
+    if visible:                           # one glow blend over the court area for all dots
+        gr = int(dot_r * 2.2)
+
+        def glows(L, ox, oy):
+            for _, color, (cx, cy) in visible:
+                cv2.circle(L, (cx - ox, cy - oy), gr, color, -1, cv2.LINE_AA)
+        blend_roi(frame, (ix1 - gr - 2, iy1 - gr - 2, ix1 + iw + gr + 3, iy1 + ih + gr + 3), 0.35, glows)
     for sid, color, (cx, cy) in visible:
-        glow = frame.copy()
-        cv2.circle(glow, (cx, cy), int(dot_r * 2.2), color, -1, cv2.LINE_AA)
-        cv2.addWeighted(glow, 0.35, frame, 0.65, 0, frame)
         cv2.circle(frame, (cx, cy), dot_r, color, -1, cv2.LINE_AA)
         cv2.circle(frame, (cx, cy), dot_r + 1, (255, 255, 255), 1, cv2.LINE_AA)
 
@@ -2398,7 +2943,6 @@ def draw_minimap(frame, slot_mgr, now, s, ball=None):
         for lx, ly in options:
             r = (lx, ly - lh, lx + lw, ly + 2)
             cost = sum(_overlap_area(r, o) for o in dot_rects + label_rects)
-            # penalise leaving the court rectangle
             cost += (lw * lh) * (r[0] < bounds[0] or r[2] > bounds[2] or r[1] < bounds[1] or r[3] > bounds[3])
             if best is None or cost < best_cost:
                 best, best_cost = (lx, ly, r), cost
@@ -2409,68 +2953,75 @@ def draw_minimap(frame, slot_mgr, now, s, ball=None):
         put_text(frame, label, (lx, ly), fs, (255, 255, 255), 2, s)
 
     if ball is not None and ball.visible and ball.court_pos is not None:
-        tr = [to_px(x, y) for x, y in ball.court_trail]
+        tr = [to_px(x, y) for x, y in list(ball.court_trail)[-12:]]
         for i in range(1, len(tr)):
             a = i / max(1, len(tr) - 1)
             cv2.line(frame, tr[i - 1], tr[i], (int(120 + 135 * a), 255, 255), max(1, int(round(1.5 * s))), cv2.LINE_AA)
         bx, by = to_px(*ball.court_pos)
+        if len(tr) >= 3 and math.hypot(bx - tr[-3][0], by - tr[-3][1]) > 3:      # flight direction vector
+            cv2.arrowedLine(frame, tr[-3], (bx, by), (0, 255, 255), max(1, int(round(1.5 * s))), cv2.LINE_AA,
+                            tipLength=0.45)
         pr = int(max(3, 5 * s) * (1.0 + 0.35 * abs(math.sin(now * 6))))
-        glow = frame.copy()
-        cv2.circle(glow, (bx, by), pr * 2, (0, 255, 255), -1, cv2.LINE_AA)
-        cv2.addWeighted(glow, 0.45, frame, 0.55, 0, frame)
-        cv2.circle(frame, (bx, by), pr, (255, 255, 255), -1, cv2.LINE_AA)
+        blend_roi(frame, (bx - 2 * pr - 2, by - 2 * pr - 2, bx + 2 * pr + 3, by + 2 * pr + 3), 0.55,
+                  lambda L, ox, oy: cv2.circle(L, (bx - ox, by - oy), pr * 2, (0, 255, 255), -1, cv2.LINE_AA))
+        cv2.circle(frame, (bx, by), pr, (225, 255, 255), -1, cv2.LINE_AA)
         cv2.circle(frame, (bx, by), pr + 1, (0, 255, 255), max(1, int(round(1.5 * s))), cv2.LINE_AA)
     return rect
 
 
+# ---------------------------------------------------------------- panels
 def draw_coach_panel(frame, slot_mgr, now, s, fps_val, source_label, recording, rec_seconds, max_w):
     m = int(16 * s)
     x1, y1 = m, m
     pw = int(min(520 * s, max_w))
     lh = int(21 * s)
-    tx = x1 + int(12 * s)
     inner_w = pw - int(24 * s)
 
-    active = [p for p in slot_mgr.players.values() if p.is_active(now)] if slot_mgr else []
-    rows = 2 * len(active) if active else 1
-    ph = int(32 * s) + lh * 3 + int(8 * s) + rows * lh + int(10 * s)
-    draw_glass_box(frame, x1, y1, x1 + pw, y1 + ph, bg=(18, 18, 18), alpha=0.86, border=(90, 90, 90))
-
-    # Header + pulsing REC indicator
-    rec_w = int(100 * s) if recording else 0
-    header = fit_text(f"PadelIQ LIVE | {fps_val:.1f} FPS | {source_label}", 0.55 * s, 2, inner_w - rec_w)
-    y = y1 + int(26 * s)
-    put_text(frame, header, (tx, y), 0.55 * s, (0, 255, 180), 2, s)
-    if recording:
-        pulse = 0.5 + 0.5 * math.sin(now * 2 * math.pi * 1.2)
-        rx = x1 + pw - rec_w
-        r = max(4, int(7 * s))
-        col = (0, 0, int(140 + 115 * pulse))
-        cv2.circle(frame, (rx + r, y - int(5 * s)), int(r * (0.8 + 0.25 * pulse)), col, -1, cv2.LINE_AA)
+    def content():
+        active = [p for p in slot_mgr.players.values() if p.is_active(now)] if slot_mgr else []
+        rows = tuple((p.slot_id, tuple(coach_suggestions(p, now))) for p in sorted(active, key=lambda q: q.slot_id))
         mm, ss = divmod(int(rec_seconds), 60)
-        put_text(frame, f"REC {mm:02d}:{ss:02d}", (rx + 2 * r + int(5 * s), y), 0.48 * s, (60, 60, 255), 2, s)
+        return f"PadelIQ LIVE | {fps_val:.1f} FPS | {source_label}", (f"REC {mm:02d}:{ss:02d}" if recording else ""), rows
+    header, rec, rows = hud_slow("coach", now, content)
+    nrows = sum(max(1, len(t)) for _, t in rows) if rows else 1
+    ph = int(32 * s) + lh * 3 + int(8 * s) + nrows * lh + int(10 * s)
+    rec_w = int(100 * s) if rec else 0
+    tx = int(12 * s)
 
-    y += lh + int(2 * s)
-    ctl = fit_text("[C] Calibrate  [R] Reset Stats  [S] Record  [Q] Quit", 0.42 * s, 1, inner_w)
-    put_text(frame, ctl, (tx, y), 0.42 * s, (200, 200, 200), 1, s)
-    y += lh + int(6 * s)
-    put_text(frame, "AI Coach Suggestions:", (tx, y), 0.52 * s, (255, 255, 255), 2, s)
-    y += lh
-
-    if not active:
-        msg = "Waiting for players inside calibrated zone..."
-        put_text(frame, fit_text(msg, 0.44 * s, 1, inner_w), (tx, y), 0.44 * s, (180, 180, 180), 1, s)
-    else:
+    def paint(im):
+        y = int(26 * s)
+        put_text(im, fit_text(header, 0.55 * s, 2, inner_w - rec_w), (tx, y), 0.55 * s, (0, 255, 180), 2, s)
+        if rec:
+            r = max(4, int(7 * s))
+            put_text(im, rec, (pw - rec_w + 2 * r + int(5 * s), y), 0.48 * s, (60, 60, 255), 2, s)
+        y += lh + int(2 * s)
+        put_text(im, fit_text("[C] Calibrate  [L] Lock  [E] Shutter  [F] Full  [F12] Failover  [M] QR  [S] Rec  [Q] Quit",
+                              0.42 * s, 1, inner_w), (tx, y), 0.42 * s, (200, 200, 200), 1, s)
+        y += lh + int(6 * s)
+        put_text(im, "AI Coach Suggestions:", (tx, y), 0.52 * s, (255, 255, 255), 2, s)
+        y += lh
+        if not rows:
+            put_text(im, fit_text("Waiting for players inside calibrated zone...", 0.44 * s, 1, inner_w), (tx, y),
+                     0.44 * s, (180, 180, 180), 1, s)
+            return
         label_w = int(40 * s)
-        for p in sorted(active, key=lambda q: q.slot_id):
-            color = SLOT_COLORS[p.slot_id]
-            put_text(frame, f"P{p.slot_id}", (tx, y), 0.46 * s, color, 2, s)
-            for tip in coach_suggestions(p, now):
+        for sid, tips in rows:
+            color = SLOT_COLORS[sid]
+            put_text(im, f"P{sid}", (tx, y), 0.46 * s, color, 2, s)
+            for tip in tips or ("",):
                 bx = tx + label_w
-                cv2.circle(frame, (bx + int(3 * s), y - int(5 * s)), max(2, int(3 * s)), color, -1, cv2.LINE_AA)
-                put_text(frame, fit_text(tip, 0.43 * s, 1, inner_w - label_w - int(14 * s)),
-                         (bx + int(12 * s), y), 0.43 * s, (235, 235, 235), 1, s)
+                if tip:
+                    cv2.circle(im, (bx + int(3 * s), y - int(5 * s)), max(2, int(3 * s)), color, -1, cv2.LINE_AA)
+                    put_text(im, fit_text(tip, 0.43 * s, 1, inner_w - label_w - int(14 * s)),
+                             (bx + int(12 * s), y), 0.43 * s, (235, 235, 235), 1, s)
                 y += lh
+    composite_patch(frame, x1, y1, hud_patch("coach", (header, rec, rows), (pw, ph), paint, (18, 18, 18), (90, 90, 90)),
+                    0.86)
+    if rec:                                                    # pulsing REC dot animates every frame
+        pulse = 0.5 + 0.5 * math.sin(now * 2 * math.pi * 1.2)
+        r = max(4, int(7 * s))
+        cv2.circle(frame, (x1 + pw - rec_w + r, y1 + int(21 * s)), int(r * (0.8 + 0.25 * pulse)),
+                   (0, 0, int(140 + 115 * pulse)), -1, cv2.LINE_AA)
     return (x1, y1, x1 + pw, y1 + ph)
 
 
@@ -2500,7 +3051,6 @@ def draw_player_cards(frame, slot_mgr, now, s, obstacles):
             continue
         x1, y1, x2, y2 = boxes[sid]
         others = [b for k, b in boxes.items() if k != sid]
-
         cx = (x1 + x2) // 2
         options = [
             (cx - cw // 2, y1 - ch - gap),      # above
@@ -2521,19 +3071,20 @@ def draw_player_cards(frame, slot_mgr, now, s, obstacles):
             if cost == 0:
                 break
         placed.append(best)
-        bx1, by1, bx2, by2 = best
-        draw_glass_box(frame, bx1, by1, bx2, by2, bg=(15, 15, 15), alpha=0.82, border=color)
-        lines = [
+        lines = hud_slow(("card", sid), now, lambda p=p, sid=sid: (
             f"P{sid} (Coverage: {p.coverage_pct:.1f}%)",
             f"Distance: {p.distance_m:.1f}m",
             f"AvgSpeed: {p.avg_speed_ms:.2f}m/s",
             f"Active: {int(p.active_seconds_total)}s ({p.active_pct}%)",
             f"Stability: {int(p.stability_pct)}%",
-        ]
-        for idx, txt in enumerate(lines):
-            ty = by1 + int(18 * s) + idx * int(17.5 * s)
-            put_text(frame, fit_text(txt, 0.42 * s, 1, cw - int(14 * s)), (bx1 + int(8 * s), ty), 0.42 * s,
-                     color if idx == 0 else (240, 240, 240), 2 if idx == 0 else 1, s)
+        ))
+
+        def paint(im, lines=lines, color=color):
+            for idx, txt in enumerate(lines):
+                ty = int(18 * s) + idx * int(17.5 * s)
+                put_text(im, fit_text(txt, 0.42 * s, 1, cw - int(14 * s)), (int(8 * s), ty), 0.42 * s,
+                         color if idx == 0 else (240, 240, 240), 2 if idx == 0 else 1, s)
+        composite_patch(frame, best[0], best[1], hud_patch(("card", sid), lines, (cw, ch), paint, (15, 15, 15), color), 0.82)
 
 
 def draw_compact_tags(frame, slot_mgr, now, s):
@@ -2546,7 +3097,7 @@ def draw_compact_tags(frame, slot_mgr, now, s):
             continue
         x1, y1, x2, y2 = map(int, p.display_bbox(now))
         color = SLOT_COLORS[sid]
-        label = f"P{sid}  {p.instant_speed_ms:.1f} m/s"
+        label = hud_slow(("tag", sid), now, lambda p=p, sid=sid: f"P{sid}  {p.instant_speed_ms:.1f} m/s")
         (tw, th), _ = cv2.getTextSize(label, FONT, fs, 1)
         bw, bh = tw + int(14 * s), th + int(12 * s)
         bx = int(np.clip((x1 + x2) // 2 - bw // 2, 2, max(2, w - bw - 2)))
@@ -2560,22 +3111,29 @@ def draw_compact_tags(frame, slot_mgr, now, s):
                 break
             by = int(np.clip(by - bh - 2, 2, max(2, h - bh - 2))) if by > bh + 4 else by + bh + 2
         placed.append((bx, by, bx + bw, by + bh))
-        draw_glass_box(frame, bx, by, bx + bw, by + bh, bg=(12, 12, 12), alpha=0.82, border=color)
-        cv2.rectangle(frame, (bx, by), (bx + max(3, int(4 * s)), by + bh - 1), color, -1)
-        put_text(frame, label, (bx + int(9 * s), by + bh - int(7 * s)), fs, (245, 245, 245), 1, s)
+
+        def paint(im, label=label, color=color, bh=bh):
+            cv2.rectangle(im, (0, 0), (max(3, int(4 * s)), bh - 1), color, -1)
+            put_text(im, label, (int(9 * s), bh - int(7 * s)), fs, (245, 245, 245), 1, s)
+        composite_patch(frame, bx, by, hud_patch(("tag", sid), label, (bw, bh), paint, (12, 12, 12), color), 0.82)
 
 
-def draw_compact_header(frame, s, fps_val, source_label):
-    text = fit_text(f"PadelIQ LIVE  |  {fps_val:.0f} FPS AI  |  {source_label}", 0.5 * s, 1, frame.shape[1] * 0.6)
+def draw_compact_header(frame, s, fps_val, source_label, now=None):
+    now = time.time() if now is None else now
+    text = hud_slow("compact_header", now, lambda: fit_text(
+        f"PadelIQ LIVE  |  {fps_val:.0f} FPS AI  |  {source_label}", 0.5 * s, 1, frame.shape[1] * 0.6))
     (tw, th), _ = cv2.getTextSize(text, FONT, 0.5 * s, 1)
-    x1, y1 = frame.shape[1] - tw - int(30 * s) - int(12 * s), int(12 * s)
-    draw_glass_box(frame, x1, y1, x1 + tw + int(30 * s), y1 + th + int(16 * s), bg=(10, 10, 10), alpha=0.82)
-    cv2.circle(frame, (x1 + int(11 * s), y1 + (th + int(16 * s)) // 2), max(3, int(4 * s)), (60, 220, 60), -1, cv2.LINE_AA)
-    put_text(frame, text, (x1 + int(22 * s), y1 + th + int(8 * s)), 0.5 * s, (235, 235, 235), 1, s)
+    bw, bh = tw + int(30 * s), th + int(16 * s)
+    x1, y1 = frame.shape[1] - bw - int(12 * s), int(12 * s)
+
+    def paint(im):
+        cv2.circle(im, (int(11 * s), bh // 2), max(3, int(4 * s)), (60, 220, 60), -1, cv2.LINE_AA)
+        put_text(im, text, (int(22 * s), th + int(8 * s)), 0.5 * s, (235, 235, 235), 1, s)
+    composite_patch(frame, x1, y1, hud_patch("compact_header", text, (bw, bh), paint, (10, 10, 10)), 0.82)
 
 
 def draw_reconnect_banner(frame, now, s, detail=""):
-    """Non-blocking translucent banner with a spinner."""
+    """No frame to hold yet (first connect): centred banner with a spinner."""
     h, w = frame.shape[:2]
     bw, bh = int(min(w - 20, 600 * s)), int(84 * s)
     x1, y1 = (w - bw) // 2, int(h * 0.42)
@@ -2586,20 +3144,67 @@ def draw_reconnect_banner(frame, now, s, detail=""):
     cv2.ellipse(frame, c, (r, r), 0, start, start + 270, (0, 190, 255), max(2, int(3 * s)), cv2.LINE_AA)
     dots = "." * (1 + int(now * 2) % 3)
     tx = x1 + int(64 * s)
-    put_text(frame, fit_text("Reconnecting to Live Stream" + dots, 0.75 * s, 2, bw - int(76 * s)),
+    put_text(frame, fit_text("Connecting to Live Stream" + dots, 0.75 * s, 2, bw - int(76 * s)),
              (tx, y1 + int(38 * s)), 0.75 * s, (0, 215, 255), 2, s)
     if detail:
         put_text(frame, fit_text(detail, 0.45 * s, 1, bw - int(76 * s)), (tx, y1 + int(66 * s)), 0.45 * s,
                  (210, 210, 210), 1, s)
 
 
+def draw_relock_badge(frame, now, s, detail=""):
+    """Subtle bottom-centre badge while the last clean frame is held and the camera re-initialises."""
+    h, w = frame.shape[:2]
+    title = "Re-locking Camera" + "." * (1 + int(now * 2) % 3)
+    text = hud_slow("relock", now, lambda: fit_text(f"{title}   {detail}" if detail else title, 0.5 * s, 1, w * 0.6))
+    (tw, th), _ = cv2.getTextSize(text, FONT, 0.5 * s, 1)
+    bw, bh = tw + int(44 * s), th + int(18 * s)
+    x1, y1 = (w - bw) // 2, h - bh - int(18 * s)
+    composite_patch(frame, x1, y1, hud_patch("relock", text, (bw, bh), lambda im: put_text(
+        im, text, (int(34 * s), th + int(9 * s)), 0.5 * s, (0, 215, 255), 1, s), (10, 10, 10), (0, 190, 255)), 0.72)
+    r = max(5, int(8 * s))
+    start = int((now * 360) % 360)
+    cv2.ellipse(frame, (x1 + int(17 * s), y1 + bh // 2), (r, r), 0, start, start + 270, (0, 190, 255),
+                max(1, int(2 * s)), cv2.LINE_AA)
+
+
+def draw_lock_badge(frame, s):
+    """'CALIBRATION LOCKED' with a padlock pictogram, bottom-left."""
+    h, w = frame.shape[:2]
+    text = "CALIBRATION LOCKED"
+    (tw, th), _ = cv2.getTextSize(text, FONT, 0.46 * s, 1)
+    bw, bh = tw + int(40 * s), th + int(16 * s)
+
+    def paint(im):
+        bx, by = int(10 * s), bh // 2
+        cv2.ellipse(im, (bx + int(6 * s), by - int(2 * s)), (int(4 * s), int(5 * s)), 0, 180, 360, (80, 255, 140),
+                    max(1, int(2 * s)), cv2.LINE_AA)
+        cv2.rectangle(im, (bx, by - int(2 * s)), (bx + int(12 * s), by + int(7 * s)), (80, 255, 140), -1)
+        put_text(im, text, (int(30 * s), th + int(8 * s)), 0.46 * s, (80, 255, 140), 1, s)
+    composite_patch(frame, int(16 * s), h - bh - int(16 * s),
+                    hud_patch("lock_badge", round(s, 3), (bw, bh), paint, (10, 10, 10), (80, 255, 140)), 0.78)
+
+
+def draw_toast(frame, s, text):
+    """Short operator feedback (exposure mode, lock, source swap) above the bottom edge."""
+    if not text:
+        return
+    h, w = frame.shape[:2]
+    text = fit_text(text, 0.6 * s, 2, w * 0.7)
+    (tw, th), _ = cv2.getTextSize(text, FONT, 0.6 * s, 2)
+    bw, bh = tw + int(32 * s), th + int(22 * s)
+    composite_patch(frame, (w - bw) // 2, h - bh - int(70 * s), hud_patch("toast", text, (bw, bh), lambda im: put_text(
+        im, text, (int(16 * s), th + int(11 * s)), 0.6 * s, (255, 255, 255), 2, s), (20, 20, 20), (0, 255, 180)), 0.85)
+
+
 def render_live_hud(frame, slot_mgr, corners_px, fps_val, H=None, source_label="LIVE",
                     recording=False, rec_seconds=0.0, reconnecting=False, reconnect_detail="",
-                    hud_mode="full", ball=None, review=None, web=False, now=None):
+                    hud_mode="full", ball=None, review=None, web=False, now=None,
+                    held=False, locked=False, toast=""):
     """
     Draws the PadelIQ HUD in place. Works for any resolution (scales from 720p).
     hud_mode="full": coach panel + minimap + stat cards (desktop).
     hud_mode="compact": court, boxes and small speed tags (web dashboard shows the rest).
+    held=True: the frame is the last clean one, held while the camera re-locks (subtle badge, no big banner).
     """
     now = time.time() if now is None else float(now)
     s = hud_scale(frame)
@@ -2612,27 +3217,32 @@ def render_live_hud(frame, slot_mgr, corners_px, fps_val, H=None, source_label="
     if hud_mode == "compact":
         if slot_mgr is not None:
             draw_compact_tags(frame, slot_mgr, now, s)
-        draw_compact_header(frame, s, fps_val, source_label)
-        draw_ball_hud(frame, ball, now, s)
+        draw_compact_header(frame, s, fps_val, source_label, now)
         draw_calibration_review(frame, review, now, s, web=web)
-        if reconnecting:
-            draw_reconnect_banner(frame, now, s, reconnect_detail)
-        return {"coach": (0, 0, 0, 0), "minimap": (w, 0, w, 0)}
-
-    if slot_mgr is not None:
-        mini_rect = draw_minimap(frame, slot_mgr, now, s, ball=ball)
+        draw_ball_hud(frame, ball, now, s)                    # ball on top of every other layer
+        rects = {"coach": (0, 0, 0, 0), "minimap": (w, 0, w, 0)}
     else:
-        mini_rect = (w, 0, w, 0)
-    coach_rect = draw_coach_panel(frame, slot_mgr, now, s, fps_val, source_label, recording, rec_seconds,
-                                  max_w=mini_rect[0] - int(32 * s))
-    if slot_mgr is not None:
-        # Stat cards are placed so they never cover the panels or each other.
-        draw_player_cards(frame, slot_mgr, now, s, [coach_rect, mini_rect])
-    draw_ball_hud(frame, ball, now, s, obstacles=[coach_rect, mini_rect])      # on top of everything
-    draw_calibration_review(frame, review, now, s, web=web)
+        if slot_mgr is not None:
+            mini_rect = draw_minimap(frame, slot_mgr, now, s, ball=ball)
+        else:
+            mini_rect = (w, 0, w, 0)
+        coach_rect = draw_coach_panel(frame, slot_mgr, now, s, fps_val, source_label, recording, rec_seconds,
+                                      max_w=mini_rect[0] - int(32 * s))
+        if slot_mgr is not None:
+            # Stat cards are placed so they never cover the panels or each other.
+            draw_player_cards(frame, slot_mgr, now, s, [coach_rect, mini_rect])
+        draw_calibration_review(frame, review, now, s, web=web)
+        draw_ball_hud(frame, ball, now, s, obstacles=[coach_rect, mini_rect])      # on top of everything
+        rects = {"coach": coach_rect, "minimap": mini_rect}
+    if locked:
+        draw_lock_badge(frame, s)
     if reconnecting:
-        draw_reconnect_banner(frame, now, s, reconnect_detail)
-    return {"coach": coach_rect, "minimap": mini_rect}
+        if held:
+            draw_relock_badge(frame, now, s, reconnect_detail)
+        else:
+            draw_reconnect_banner(frame, now, s, reconnect_detail)
+    draw_toast(frame, s, toast)
+    return rects
 
 
 # =====================================================================
@@ -2700,18 +3310,39 @@ class PersonDetector:
     """Hybrid YOLOv8n + YOLOv8n-pose wrapper: provides person boxes, 17 COCO pose keypoints
     (`self.last_keypoints`) for ankle-floor localization, and sports-ball boxes (`self.last_balls`)."""
 
-    def __init__(self, model_path="yolov8n.pt", imgsz=640, conf=0.28):
+    def __init__(self, model_path="yolov8n.pt", imgsz=640, conf=0.28, backend="auto", pose_stride=2, use_roi=True):
         self.imgsz, self.conf = imgsz, conf
         self._errors = 0
+        self.use_roi = use_roi
         self.last_balls = np.zeros((0, 4), dtype=np.float32)
         self.last_keypoints = []
-        self.pose_det = CG.PoseCourtDetector(app_dir=APP_DIR, model_path=model_path, imgsz=imgsz, conf=conf)
+        self.pose_det = CG.PoseCourtDetector(app_dir=APP_DIR, model_path=model_path, imgsz=imgsz, conf=conf,
+                                             backend=backend)
+        self.pose_det.POSE_STRIDE = max(1, int(pose_stride))
+        self.pose_det.adaptive_pose = self.pose_det.POSE_STRIDE > 1
         self.model = self.pose_det.det_model or self.pose_det.pose_model
         get_court_ai(self.pose_det)
         if self.pose_det.ready:
-            log(f"AI Detector + Pose Engine ready (pose backend: {self.pose_det.pose_backend})")
+            log(f"AI engine ready: detection {self.pose_det.det_backend} @ {self.pose_det.det_imgsz} | pose "
+                f"{self.pose_det.pose_backend} (stride {self.pose_det.POSE_STRIDE}) | court ROI "
+                f"{'on' if use_roi else 'off'}")
         else:
             log("WARNING: YOLO/Pose models unavailable. HUD will run without player detection.")
+
+    @property
+    def backend_info(self):
+        pd = self.pose_det
+        st = pd.stats
+        tot = st["pose_crops"] + st["pose_reused"]
+        return {"det_backend": pd.det_backend, "det_imgsz": pd.det_imgsz, "pose_backend": pd.pose_backend,
+                "pose_stride": pd.POSE_STRIDE, "roi": list(pd.roi) if pd.roi else None,
+                "pose_reuse_pct": round(100.0 * st["pose_reused"] / tot, 1) if tot else None}
+
+    def set_roi(self, roi):
+        self.pose_det.set_roi(roi if self.use_roi else None)
+
+    def set_roi_from_corners(self, corners, frame_shape):
+        self.set_roi(CG.PoseCourtDetector.court_roi(corners, frame_shape))
 
     def __call__(self, frame):
         """Returns `(N, 4)` person boxes; populates `self.last_keypoints` and `self.last_balls`."""
@@ -2779,7 +3410,90 @@ class LiveSession:
         self.ball = PadelBallTracker()
         self.last_boxes = np.zeros((0, 4), np.float32)
         self.last_yolo_balls = np.zeros((0, 4), np.float32)
+        self.last_kps = []
+        self.last_det_ts = None
         self.lock = threading.RLock()       # display loop <-> async AI worker (slot manager / geometry)
+        self.calib_locked = False           # [L]: geometry keys / scene-cut re-calibration disabled on stage
+        self.roi_setter = None              # detector.set_roi (court-ROI guided inference)
+        self._roi_key = None
+        self._stash = {}                    # per-source confirmed calibration (F12 swaps)
+        self.epoch = 0                      # bumps on source swaps: stale AI results are dropped
+        self._toast = ("", 0.0)
+
+    # --------------------------------------------------------- stage helpers
+    def toast(self, msg, secs=2.2):
+        self._toast = (msg, time.time() + secs)
+        log(msg)
+
+    def toast_text(self, now=None):
+        msg, until = self._toast
+        return msg if msg and (now or time.time()) < until else ""
+
+    def set_lock(self, locked):
+        rv = self.review
+        if locked:
+            if rv.state in ("review", "manual") and rv.confirm("operator (lock)") and self.canvas_shape is not None:
+                self.save_confirmed(self.canvas_shape)
+            if rv.state != "confirmed":
+                self.toast("Confirm the court calibration before locking it")
+                return False
+        self.calib_locked = bool(locked)
+        self.toast("Calibration Locked - geometry keys disabled" if locked else "Calibration Unlocked")
+        return True
+
+    def _update_roi(self):
+        if self.roi_setter is None:
+            return
+        rv = self.review
+        key = (rv.state == "confirmed", rv.version, self.canvas_shape, self.applied_version)
+        if key == self._roi_key:
+            return
+        self._roi_key = key
+        roi = None
+        if key[0] and self.corners is not None and self.canvas_shape is not None:
+            roi = CG.PoseCourtDetector.court_roi(self.corners, self.canvas_shape)
+        self.roi_setter(roi)
+        if roi:
+            log(f"Court-ROI guided inference: detector crop {roi[2] - roi[0]}x{roi[3] - roi[1]} at ({roi[0]}, {roi[1]})")
+
+    @staticmethod
+    def _src_key(spec):
+        return f"{spec.kind}:{spec.source}"
+
+    def switch_source(self, new_spec):
+        """F12 hot-swap: stash this source's confirmed calibration, restore the target's (or start a fresh one)."""
+        if self.spec is not None and self.review.state == "confirmed" and self.corners is not None \
+                and self.canvas_shape is not None:
+            self._stash[self._src_key(self.spec)] = {
+                "corners": self.corners.copy(), "info": dict(self.review.info), "shape": self.canvas_shape,
+                "locked": self.calib_locked, "floor_mask": self.slot_mgr.floor_mask,
+                "floor_top_y": self.slot_mgr.floor_top_y}
+        self.spec = new_spec
+        self.save_path, self.load_paths = calibration_files_for(new_spec.kind)
+        self.epoch += 1
+        self.slot_mgr.reset_players()
+        self.ball.reset()
+        self.scene_cut.reset()
+        self.calib_frames.clear()
+        self.last_boxes, self.last_yolo_balls, self.last_kps = np.zeros((0, 4), np.float32), np.zeros((0, 4), np.float32), []
+        st = self._stash.get(self._src_key(new_spec))
+        if st:
+            self.canvas_shape = st["shape"]
+            self.corners = st["corners"].copy()
+            self.H = compute_homography(self.corners)
+            self.review.restore(self.corners, st["info"], st["shape"])
+            self.applied_version = self.review.version
+            self.slot_mgr.set_homography(self.H)
+            self.slot_mgr.floor_mask, self.slot_mgr.floor_top_y = st["floor_mask"], st["floor_top_y"]
+            self.ball.set_geometry(self.H, self.canvas_shape)
+            self.calib_locked = st["locked"]
+        else:
+            self.canvas_shape = None
+            self.corners = self.H = None
+            self.review.reset()
+            self.calib_locked = False
+        self._roi_key = None
+        self._update_roi()
 
     # --------------------------------------------------------- auto-calibration review
     def _frames_for_calibration(self):
@@ -2817,7 +3531,7 @@ class LiveSession:
         if self.review.state == "detecting" and now - self._last_calib_grab > 0.045:
             self.calib_frames.append(canvas.copy())
             self._last_calib_grab = now
-        elif self.review.state in ("review", "confirmed", "failed"):
+        elif self.review.state in ("review", "confirmed", "failed") and not self.calib_locked:
             # Automatic Scene-Cut Detector: re-calibrate immediately if stream cuts to a new court/angle!
             cut, metrics = self.scene_cut.update(canvas, now=now)
             if cut:
@@ -2847,6 +3561,7 @@ class LiveSession:
                     self.slot_mgr.reset_players()
                 self.ball.set_geometry(H, (canvas_shape[0], canvas_shape[1]))
             self.applied_version = rv.version
+        self._update_roi()
 
     def save_confirmed(self, canvas_shape):
         if self.corners is None:
@@ -2888,6 +3603,25 @@ class LiveSession:
             return
         ch = chr(key).lower() if key < 256 else ""
         rv = self.review
+        cam = self.cam_getter() if callable(self.cam_getter) else None
+        if ch == "l":
+            self.set_lock(not self.calib_locked)
+            return
+        if ch == "e":
+            if cam is None or cam.kind != "webcam":
+                self.toast("Exposure control applies to USB webcams")
+            else:
+                cam.toggle_exposure()
+                self.toast(f"Camera: {cam.exposure_label}")
+            return
+        if ch == "k":
+            if cam is not None and cam.kind == "webcam":
+                cam.open_driver_settings()
+                self.toast("Camera driver settings (Power Line Frequency 50 Hz)")
+            return
+        if self.calib_locked and (ch in ("c", "a", "n", "h") or (rv.state == "manual" and key == 27)):
+            self.toast("Calibration is locked - press [L] to unlock")
+            return
         if rv.state == "manual" and key == 27:
             with rv.lock:
                 rv.state, rv.review_since = "review", time.time()
@@ -2896,7 +3630,7 @@ class LiveSession:
             if rv.confirm("operator") and self.canvas_shape is not None:
                 self.save_confirmed(self.canvas_shape)
             return
-        if ch in ("m", "c"):
+        if ch == "c":
             if clean_canvas is None:
                 log("Calibration needs a live frame - waiting for the stream.")
                 return
@@ -2945,7 +3679,7 @@ class AsyncAIWorker:
 
     def submit(self, canvas, ts):
         with self.cond:
-            self.pending = (canvas, ts)          # overwrite: never process a stale frame
+            self.pending = (canvas, ts, self.session.epoch)   # overwrite: never process a stale frame
             self.cond.notify()
 
     def _loop(self):
@@ -2957,15 +3691,16 @@ class AsyncAIWorker:
                 job, self.pending = self.pending, None
             if job is None:
                 continue
-            canvas, ts = job
+            canvas, ts, epoch = job
             try:
                 t0 = time.perf_counter()
                 boxes = self.detector(canvas)
                 self.latency_ms = 0.8 * self.latency_ms + 0.2 * (time.perf_counter() - t0) * 1000 if self.inferred \
                     else (time.perf_counter() - t0) * 1000
                 with s.lock:
-                    if s.canvas_shape == canvas.shape[:2]:
+                    if s.canvas_shape == canvas.shape[:2] and s.epoch == epoch:
                         s.last_boxes, s.last_yolo_balls = boxes, self.detector.last_balls
+                        s.last_kps, s.last_det_ts = self.detector.last_keypoints, ts
                         s.slot_mgr.update_detections(boxes, now=ts, keypoints=self.detector.last_keypoints,
                                                      frame_shape=canvas.shape)
                 self.inferred += 1
@@ -2997,6 +3732,133 @@ def tune_runtime_threads():
         pass
 
 
+class SessionMobileController:
+    """Lets the paired phone drive the desktop LiveSession calibration (padeliq_mobile_bridge.MobileController).
+    Called from the HTTPS bridge thread; every geometry change honours the stage calibration lock."""
+
+    def __init__(self, session):
+        self.s = session
+        self.last_canvas = None
+        self.phone_ready = False            # set on the first phone frame -> the display loop swaps sources
+
+    def _active(self):
+        return self.s.spec is not None and self.s.spec.kind == "mobile"
+
+    def _unlocked(self):
+        if self.s.calib_locked:
+            raise ValueError("calibration is locked on stage - press [L] on the PC to unlock")
+
+    def calibration_snapshot(self):
+        s, now = self.s, time.time()
+        if not self._active():
+            return {"state": "idle", "corners": None, "frame_shape": None, "locked": s.calib_locked}
+        rv = s.review
+        st = rv.status()
+        with rv.lock:
+            corners = None if rv.corners is None else rv.corners.copy()
+            version = rv.version
+        with s.lock:
+            players = sum(1 for p in list(s.slot_mgr.players.values()) if p.is_active(now))
+            shape = s.canvas_shape
+        return dict(st, corners=corners, frame_shape=shape, version=version, players=players,
+                    inference_fps=round(s.fps, 1), locked=s.calib_locked)
+
+    def auto_detect(self):
+        self._unlocked()
+        canvas = self.last_canvas
+        if not self._active() or canvas is None:
+            raise ValueError("no phone frame yet")
+        with self.s.lock:
+            self.s.start_auto_calibration(seed_frame=canvas)
+        end = time.time() + 30.0
+        while time.time() < end and self.s.review.state == "detecting":
+            time.sleep(0.1)
+        rv = self.s.review
+        if rv.state == "failed":
+            raise ValueError(f"court not found ({rv.error}) - drag the 4 corners manually")
+        if rv.corners is None:
+            raise ValueError("court detection still running")
+        return (f"Court detected: {rv.info.get('confidence_pct') or 0:.0f}% ({rv.info.get('angle') or 'Baseline'}) "
+                f"- drag corners to fine-tune, then Lock")
+
+    def preview_corners(self, corners_px):
+        self._unlocked()
+        s = self.s
+        with s.lock:
+            if s.canvas_shape is None:
+                raise ValueError("no phone frame yet")
+            if compute_homography(corners_px) is None:
+                raise ValueError("corners must form a convex court in order TL, TR, BR, BL")
+            s.review.frame_shape = tuple(s.canvas_shape)
+            s.review.set_manual_corners(corners_px, dict(s.review.info, method="phone_touch"))
+
+    def lock(self, corners_px=None):
+        s = self.s
+        if corners_px is not None:
+            self.preview_corners(corners_px)
+        with s.lock:
+            rv = s.review
+            if rv.state != "confirmed" and not rv.confirm("operator (phone)"):
+                raise ValueError(f"nothing to lock yet (calibration state: {rv.state})")
+            s.sync_review(s.canvas_shape)
+            s.save_confirmed(s.canvas_shape)
+            if not s.calib_locked:
+                s.set_lock(True)
+        return "Court locked - live analytics started"
+
+    def on_phone_connected(self, meta):
+        self.phone_ready = True
+
+    def hud_jpeg(self):
+        return None
+
+
+def start_desktop_mobile_bridge(args, session):
+    """QR phone portal for the desktop window. The HTTPS server (cert generation, bind) starts in the background so
+    the stage window never freezes. Returns (MB module, hub, controller)."""
+    import padeliq_mobile_bridge as MB
+    hub = MB.MobileHub(https_port=args.mobile_port, lan_ip=args.lan_ip, token=args.mobile_token or None)
+    ctrl = SessionMobileController(session)
+    hub.controller = ctrl
+    if args.no_https:
+        hub.https_error = "disabled with --no-https"
+    else:
+        threading.Thread(target=lambda: MB.start_https_server(MB.build_https_app(hub), hub,     # FastAPI import +
+                                                             os.path.join(APP_DIR, "certs")),  # cert gen off-thread
+                         name="PadelIQ-https-start", daemon=True).start()
+    log(f"Mobile QR portal: scan the QR code in the window or open {hub.url.split('?')[0]}")
+    return MB, hub, ctrl
+
+
+def draw_qr_overlay(frame, MB, hub, cache):
+    """[M] pairing card (QR + URL + link state) in the bottom-right corner, pre-rendered once per state."""
+    h, w = frame.shape[:2]
+    s = h / 720.0
+    state = "connected" if hub.connected else ("ready" if hub.https_enabled else (hub.https_error or "starting"))
+    key = (w, h, hub.url, state)
+    if cache.get("key") != key:
+        q = int(250 * s)
+        pad = int(14 * s)
+        cw, ch = q + 2 * pad, q + int(96 * s) + 2 * pad
+        card = np.full((ch, cw, 3), (24, 18, 12), np.uint8)
+        card[pad:pad + q, pad:pad + q] = cv2.resize(hub.qr_image(q), (q, q), interpolation=cv2.INTER_NEAREST)
+        y = pad + q + int(24 * s)
+        put_text(card, "MOBILE QR PORTAL", (pad, y), 0.6 * s, (0, 255, 180), 2, s)
+        put_text(card, fit_text(hub.url.split("?")[0], 0.42 * s, 1, cw - 2 * pad), (pad, y + int(24 * s)),
+                 0.42 * s, (235, 235, 235), 1, s)
+        msg = {"connected": "Phone connected - starting stream ...", "ready": "Scan with the phone camera  [M] hide"}
+        put_text(card, fit_text(msg.get(state, f"HTTPS: {state}"), 0.42 * s, 1, cw - 2 * pad),
+                 (pad, y + int(48 * s)), 0.42 * s, (0, 200, 255) if state != "ready" else (180, 180, 180), 1, s)
+        cv2.rectangle(card, (0, 0), (cw - 1, ch - 1), (0, 255, 180), max(1, int(2 * s)))
+        cache.update(key=key, card=card)
+    card = cache["card"]
+    ch, cw = card.shape[:2]
+    m = int(18 * h / 720.0)
+    x0, y0 = max(0, w - cw - m), max(0, h - ch - m - int(40 * h / 720.0))
+    roi = frame[y0:y0 + ch, x0:x0 + cw]
+    roi[:] = card[:roi.shape[0], :roi.shape[1]]
+
+
 def run_live_padeliq(args):
     tune_runtime_threads()
     spec = resolve_source(args.source, esp32_ip=args.esp32_ip, video=args.video, backend=args.backend)
@@ -3009,26 +3871,63 @@ def run_live_padeliq(args):
     display = not (test_mode or args.no_display)
     log(f"Source: {spec.label}")
 
-    detector = PersonDetector(args.model, imgsz=args.imgsz, conf=args.conf)
-    cam = ThreadedLiveCamera(spec, stall_timeout=args.stall_timeout,
-                             cam_width=args.cam_width, cam_height=args.cam_height, cam_fps=args.cam_fps)
+    detector = PersonDetector(args.model, imgsz=args.imgsz, conf=args.conf, backend=args.ai_backend,
+                              pose_stride=args.pose_stride, use_roi=not args.no_roi)
+
     session = LiveSession(spec, args, cam_getter=lambda: cam)
+    mobile = {"MB": None, "hub": None, "ctrl": None, "card": {}, "waiting": (None, 0.0, "")}
+
+    def ensure_mobile():
+        if mobile["hub"] is None:
+            mobile["MB"], mobile["hub"], mobile["ctrl"] = start_desktop_mobile_bridge(args, session)
+        return mobile["hub"]
+
+    def make_cam(sp, exposure=args.exposure):
+        if sp.kind == "mobile":
+            return ensure_mobile().create_camera(sp, stall_timeout=args.stall_timeout)
+        return ThreadedLiveCamera(sp, stall_timeout=args.stall_timeout, cam_width=args.cam_width,
+                                  cam_height=args.cam_height, cam_fps=args.cam_fps, exposure=exposure,
+                                  sport_exposure=args.sport_exposure)
+
+    cam = make_cam(spec)
+    qr_overlay = spec.kind == "mobile"
+    session.roi_setter = detector.set_roi
     ai = AsyncAIWorker(detector, session)
+    # [F12] failover: live camera <-> clean match replay (or --failover-source). The target is opened in the
+    # background and swapped in only once it delivers frames, so the window never shows a gap.
+    swap_targets = [args.source, args.failover_source or ("sim" if spec.kind != "file" else "webcam")]
+    spec_cache = {0: spec}
+    swap_idx = 0
+    pending = None
+    max_gap_ms = 0.0                    # longest interval between displayed camera frames (swap smoothness)
+    big_gaps = []
+    swaps_done = 0
+    fullscreen = False
     e2e_ms = deque(maxlen=600)          # capture/arrival -> frame shown (per displayed camera frame)
     ball_worker = BallWorker(lambda: cam, session.ball,
-                             lambda: (session.last_boxes, session.last_yolo_balls), args.hud_min_height)
+                             lambda: (session.last_boxes, session.last_yolo_balls, session.last_kps, session.last_det_ts),
+                             args.hud_min_height)
     win_name = "PadelIQ Live Camera Engine"
     if display:
-        cv2.namedWindow(win_name, cv2.WINDOW_NORMAL)
+        cv2.namedWindow(win_name, cv2.WINDOW_NORMAL | cv2.WINDOW_KEEPRATIO)
         cv2.setMouseCallback(win_name, lambda ev, x, y, fl, pa: session.review.on_mouse(ev, x, y))
-        log("Live engine running:  [Enter/Y] confirm court  [M] adjust court  [A] re-run auto-calibration  "
-            "[R] reset  [S] record  [Q] quit")
+        log("Live engine running:  [Enter] confirm court  [C] drag corners  [A] re-scan  [L] lock calibration  "
+            "[E] auto exposure / sport shutter  [K] camera driver settings  [F] fullscreen  [F12] failover  "
+            "[M] mobile QR portal  [R] reset  [S] record  [Q] quit")
 
     # Scripted key presses exercise the same handlers headlessly during --test-run.
     scripted_keys = {}
     if test_mode:
         n = args.test_run
         scripted_keys = {max(2, n // 10): ord('s'), max(3, n // 4): ord('r'), max(4, (n * 3) // 5): ord('s')}
+        if args.test_stage_keys:
+            scripted_keys.update({max(5, (n * 7) // 10): ord('l'), max(6, (n * 3) // 4): ord('a'),
+                                  max(7, (n * 4) // 5): ord('e')})
+        if args.test_failover:
+            scripted_keys[max(8, n // 3)] = F12_KEYS[0]
+            scripted_keys[max(9, (n * 2) // 3)] = F12_KEYS[0]
+        if args.test_qr:
+            scripted_keys[max(5, n // 5)] = ord('m')
 
     processed = 0                       # frames processed by the AI worker
     displayed = 0                       # camera frames shown in the window
@@ -3042,9 +3941,42 @@ def run_live_padeliq(args):
     exit_code = 0
     recordings_made = []
     captured = False
+    captured_ball = False
 
     try:
         while not session.quit:
+            # ---- F12 failover: swap once the target camera has delivered a frame
+            if pending is not None:
+                pc = pending["cam"]
+                if pending["err"] or (time.time() - pending["t0"] > 20 and (pc is None or pc.frame_id == 0)):
+                    session.toast(f"Failover failed: {pending['err'] or 'no frames from ' + swap_targets[pending['idx']]}", 3.5)
+                    if pc is not None:
+                        threading.Thread(target=pc.release, daemon=True).start()
+                    pending = None
+                elif pc is not None and pc.frame_id > 0:
+                    if pending.get("mobile"):
+                        swap_targets[pending["idx"]], spec_cache[pending["idx"]] = "mobile", pending["spec"]
+                        qr_overlay = False
+                    old = cam
+                    with session.lock:
+                        session.switch_source(pending["spec"])
+                    cam, spec, swap_idx = pc, pending["spec"], pending["idx"]
+                    last_fid = -1
+                    pending = None
+                    swaps_done += 1
+                    threading.Thread(target=old.release, daemon=True).start()
+                    session.toast(f"Source: {spec.label}", 2.5)
+            # ---- QR portal: a scanned phone streams its first frame -> seamless swap to the phone camera
+            mc = mobile["ctrl"]
+            if mc is not None and mc.phone_ready:
+                mc.phone_ready = False
+                if spec.kind != "mobile" and pending is None and not args.no_mobile_autoswitch:
+                    msp = SourceSpec("mobile", "mobile", "MOBILE QR CAMERA")
+                    pending = {"idx": swap_idx, "t0": time.time(), "cam": make_cam(msp), "spec": msp, "err": "",
+                               "mobile": True}
+                    session.toast("Phone connected - switching to the phone camera", 2.5)
+                elif spec.kind == "mobile":
+                    qr_overlay = False
             # Wake the instant the camera publishes; never queue (newest frame only).
             raw, fid, cap_ts = cam_wait_latest(cam, last_fid, 1.0 / 60.0)
             ok = raw is not None
@@ -3060,10 +3992,16 @@ def run_live_padeliq(args):
                     session.sync_review(canvas.shape)
                 ai.submit(canvas, cap_ts)                # async YOLO + pose on the newest frame
                 last_canvas = canvas
+                if mobile["ctrl"] is not None and cam.kind == "mobile":
+                    mobile["ctrl"].last_canvas = canvas
                 displayed += 1
                 t = time.time()
                 if displayed > 1:
                     frame_intervals.append(t - fps_t0)
+                    if displayed > 30:
+                        max_gap_ms = max(max_gap_ms, (t - fps_t0) * 1000.0)
+                        if (t - fps_t0) > 0.05 and len(big_gaps) < 40:
+                            big_gaps.append((round(t - start, 2), round((t - fps_t0) * 1000), session.review.state))
                     session.fps = 1.0 / max(1e-3, float(np.median(frame_intervals)))   # display FPS (recorder)
                 fps_t0 = t
 
@@ -3088,7 +4026,21 @@ def run_live_padeliq(args):
                                 recording=session.recorder.active, rec_seconds=session.recorder.seconds,
                                 reconnecting=degraded, reconnect_detail=detail,
                                 ball=session.ball if last_canvas is not None else None,
-                                review=session.review if last_canvas is not None else None)
+                                review=session.review if last_canvas is not None else None,
+                                held=last_canvas is not None, locked=session.calib_locked,
+                                toast=session.toast_text())
+            if cam.kind == "mobile" and cam.waiting_for_phone:
+                # QR pairing screen until the phone streams (PIL text -> rebuilt at 2 Hz, then reused)
+                MBm, hub_m = mobile["MB"], mobile["hub"]
+                wdetail = MBm.waiting_detail(cam, hub_m)
+                wimg, wt, wd = mobile["waiting"]
+                if wimg is None or wd != wdetail or time.time() - wt > 0.5:
+                    wimg = MBm.render_waiting_screen(hub_m, (hud.shape[1], hud.shape[0]), wdetail)
+                    mobile["waiting"] = (wimg, time.time(), wdetail)
+                hud = wimg.copy()
+                draw_toast(hud, hud.shape[0] / 720.0, session.toast_text())
+            elif qr_overlay and mobile["hub"] is not None:
+                draw_qr_overlay(hud, mobile["MB"], mobile["hub"], mobile["card"])
             if new_frame or degraded:
                 session.recorder.write(hud)
             if args.capture_verified and not captured and last_canvas is not None and                     session.review.state == "confirmed" and session.ball.visible:
@@ -3105,12 +4057,20 @@ def run_live_padeliq(args):
                         f"ball {session.ball.speed_kmh:.0f} km/h, calibration {session.review.info.get('method')} "
                         f"({session.review.info.get('confidence_pct')}%, confirmed by {session.review.confirmed_by})")
 
+            if args.capture_ball and not captured_ball and last_canvas is not None and \
+                    session.review.state == "confirmed" and session.ball.visible and not session.ball.coasting and \
+                    len(session.ball.trail) >= 12 and session.ball.court_pos is not None and \
+                    session.ball.speed_kmh > session.ball.SPEED_MIN_KMH and                     sum(1 for p in session.slot_mgr.players.values() if p.is_active(time.time(), 0.5)) >= 4:
+                cv2.imwrite(args.capture_ball, hud)
+                captured_ball = True
+                log(f"[verify] saved {os.path.basename(args.capture_ball)}: ball {session.ball.speed_kmh:.0f} km/h, "
+                    f"trail {len(session.ball.trail)} pts, shots {session.ball.shots}, court {session.ball.court_pos}")
             if new_frame:
                 e2e_ms.append((time.time() - last_cap_ts) * 1000.0)
             key = -1
             if display:
                 cv2.imshow(win_name, hud)
-                key = cv2.waitKey(1) & 0xFF
+                key = cv2.waitKeyEx(1)
                 if shown and cv2.getWindowProperty(win_name, cv2.WND_PROP_VISIBLE) < 1:
                     log("Window closed.")
                     break
@@ -3119,9 +4079,41 @@ def run_live_padeliq(args):
                 due = [k for k in scripted_keys if k <= processed and k > prev_processed] if processed != prev_processed else []
                 if due:
                     key = scripted_keys.pop(due[0])
-                    log(f"[test] simulating key '{chr(key).upper()}' at frame {processed}")
+                    log(f"[test] simulating key '{'F12' if key in F12_KEYS else chr(key).upper()}' at frame {processed}")
 
             was_recording = session.recorder.active
+            if key in F12_KEYS:
+                if pending is None:
+                    idx = 1 - swap_idx
+                    holder = {"idx": idx, "t0": time.time(), "cam": None, "spec": None, "err": ""}
+
+                    def open_target(holder=holder, idx=idx, exposure=cam.exposure_mode):
+                        try:
+                            sp = spec_cache.get(idx) or resolve_source(swap_targets[idx], esp32_ip=args.esp32_ip,
+                                                                       video=args.video, backend=args.backend)
+                            if sp is None:
+                                raise ValueError(f"no usable source for {swap_targets[idx]!r}")
+                            spec_cache[idx] = sp
+                            holder["spec"] = sp
+                            holder["cam"] = make_cam(sp, exposure)
+                        except Exception as exc:
+                            holder["err"] = str(exc)
+                    threading.Thread(target=open_target, daemon=True).start()
+                    pending = holder
+                    session.toast(f"[F12] Failover -> {swap_targets[idx]} (current view stays live until it is ready)", 3.0)
+                key = -1
+            elif key in (ord('m'), ord('M')):
+                ensure_mobile()
+                qr_overlay = not qr_overlay
+                session.toast("Mobile QR portal: scan to stream the phone camera" if qr_overlay else "QR portal hidden")
+                key = -1
+            elif display and key in (ord('f'), ord('F')):
+                fullscreen = not fullscreen
+                cv2.setWindowProperty(win_name, cv2.WND_PROP_FULLSCREEN,
+                                      cv2.WINDOW_FULLSCREEN if fullscreen else cv2.WINDOW_NORMAL)
+                key = -1
+            elif key >= 256:
+                key = -1
             with session.lock:
                 session.handle_key(key, clean_canvas=last_canvas, hud_frame=hud)
             if was_recording and not session.recorder.active and session.last_recording:
@@ -3136,6 +4128,16 @@ def run_live_padeliq(args):
                         f"{ai.latency_ms:.0f} ms/inference) | window showed {displayed} camera frames "
                         f"(~{session.fps:.1f} display FPS) | capture->display latency median {np.median(lat):.1f} ms, "
                         f"p95 {np.percentile(lat, 95):.1f} ms -> screenshot {os.path.basename(VERIFY_SCREENSHOT)}")
+                    if args.test_qr and spec.kind != "mobile":
+                        log("[test] FAILED: [M] QR portal did not switch to the phone camera")
+                        exit_code = 1
+                    log(f"[test] stage: calibration locked={session.calib_locked} | F12 swaps={swaps_done} | "
+                        f"longest gap between displayed frames {max_gap_ms:.0f} ms | AI {detector.backend_info}")
+                    if big_gaps:
+                        log(f"[test] display gaps > 50 ms (t s, ms, calibration state): {big_gaps}")
+                    if args.test_failover and swaps_done < 2:
+                        log("[test] FAILED: F12 failover did not complete twice")
+                        exit_code = 1
                     break
                 if time.time() - start > args.test_timeout:
                     cv2.imwrite(VERIFY_SCREENSHOT, hud)
@@ -3146,6 +4148,8 @@ def run_live_padeliq(args):
         log("Interrupted by user.")
     finally:
         ai.stop()
+        if pending is not None and pending.get("cam") is not None:
+            pending["cam"].release()
         if session.recorder.active:
             p = session.recorder.stop()
             if p:
@@ -3192,14 +4196,32 @@ def verify_test_outputs(recordings, keep=False):
 def build_arg_parser():
     p = argparse.ArgumentParser(description="PadelIQ Real-Time Live Camera Engine (ESP32-CAM / RTSP / Webcam)")
     p.add_argument("--source", default="auto",
-                   help="auto (default) | sim | webcam (best colour webcam, Logitech BRIO preferred) | 0/1 (webcam index) | "
+                   help="auto (default) | sim | webcam (best colour webcam, Logitech BRIO preferred) | "
+                        "mobile (QR phone camera) | 0/1 (webcam index) | "
                         "http://<esp32-ip>:81/stream | rtsp://... | ESP32 IP | YouTube URL | video file")
     p.add_argument("--esp32-ip", default=None, help="ESP32-CAM IP or URL tried first in auto mode (env PADELIQ_STREAM_URL also works)")
     p.add_argument("--video", default=None, help="video file for simulated live mode (default: padel_input.mp4)")
     p.add_argument("--model", default="yolov8n.pt", help="YOLO model (yolov8n.pt is fastest for live use)")
     p.add_argument("--imgsz", type=int, default=DEFAULT_IMGSZ, help="YOLO inference size (512 default; 640 = slower)")
     p.add_argument("--conf", type=float, default=0.30, help="YOLO person confidence threshold")
+    p.add_argument("--ai-backend", default="auto", choices=["auto", "openvino", "pytorch"],
+                   help="auto = OpenVINO (yolov8n_openvino_model + yolov8n-pose_openvino_model) with PyTorch fallback")
+    p.add_argument("--pose-stride", type=int, default=2, help="fresh pose every N AI ticks per player (1 = every tick)")
+    p.add_argument("--no-roi", action="store_true", help="always run detection on the full frame")
+    p.add_argument("--exposure", default="auto", choices=list(EXPOSURE_MODES),
+                   help="webcam exposure at start: auto | sport (fast shutter, max FPS); toggle live with [E]")
+    p.add_argument("--sport-exposure", type=float, default=SPORT_EXPOSURE,
+                   help="sport-shutter exposure value (DirectShow log2 s: -5 = 1/32 s, -6 = 1/64 s)")
+    p.add_argument("--failover-source", default=None,
+                   help="[F12] target (default: sim replay when live, best webcam when replaying)")
     p.add_argument("--backend", default="auto", choices=["auto", "dshow", "msmf", "any"], help="webcam backend")
+    p.add_argument("--mobile-port", type=int, default=8443,
+                   help="HTTPS port of the QR phone portal ([M] or --source mobile; certs/ generated on first run)")
+    p.add_argument("--lan-ip", default=None, help="LAN IP encoded in the QR code (auto-detected by default)")
+    p.add_argument("--no-https", action="store_true", help="do not start the HTTPS phone portal")
+    p.add_argument("--no-mobile-autoswitch", action="store_true",
+                   help="[M] portal: do not switch to the phone automatically when it starts streaming")
+    p.add_argument("--mobile-token", default="", help=argparse.SUPPRESS)      # fixed pairing token (tests)
     p.add_argument("--cam-width", type=int, default=None, help="webcam width (default 1280, MJPG)")
     p.add_argument("--cam-height", type=int, default=None, help="webcam height (default 720, MJPG)")
     p.add_argument("--cam-fps", type=int, default=None, help="webcam FPS request (default 60; driver clamps)")
@@ -3210,6 +4232,11 @@ def build_arg_parser():
                    help="headless smoke test: process N frames, save live_hud_verified.jpg, exit 0 on success")
     p.add_argument("--test-timeout", type=float, default=180.0, help="max seconds for --test-run")
     p.add_argument("--keep-test-recording", action="store_true", help="keep the MP4 produced by --test-run")
+    p.add_argument("--capture-ball", default="", metavar="PATH",
+                   help="save the first full-HUD frame with a locked ball (trail, km/h tag, minimap dot)")
+    p.add_argument("--test-stage-keys", action="store_true", help="--test-run also presses [L], [A] (refused), [E]")
+    p.add_argument("--test-failover", action="store_true", help="--test-run also presses [F12] twice")
+    p.add_argument("--test-qr", action="store_true", help="--test-run also presses [M]; a phone must then stream")
     p.add_argument("--capture-verified", default="", metavar="PATH",
                    help="save the first frame with confirmed calibration, 4 players on correct sides and the ball visible")
     p.add_argument("--auto-calibrate", action="store_true",
